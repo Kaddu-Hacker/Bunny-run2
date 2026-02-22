@@ -1,0 +1,116 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          git \
+          zip \
+          unzip \
+          openjdk-17-jdk \
+          autoconf \
+          libtool \
+          pkg-config \
+          zlib1g-dev \
+          libncurses5-dev \
+          libncursesw5-dev \
+          libtinfo5 \
+          cmake \
+          libffi-dev \
+          libssl-dev \
+          automake
+    
+    - name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+    
+    - name: Install Buildozer
+      run: |
+        pip install --upgrade pip
+        pip install buildozer
+        pip install cython
+    
+    - name: Build APK with Buildozer
+      run: |
+        buildozer android debug
+    
+    - name: Get version from spec
+      id: get_version
+      run: |
+        VERSION=$(grep "^version = " buildozer.spec | cut -d'=' -f2 | tr -d ' ')
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Building version: $VERSION"
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ steps.get_version.outputs.version }}-${{ github.run_number }}
+        release_name: BunnyBot v${{ steps.get_version.outputs.version }} Build ${{ github.run_number }}
+        body: |
+          🐰 **BunnyBot Android APK**
+          
+          📦 Version: ${{ steps.get_version.outputs.version }}
+          🔨 Build: ${{ github.run_number }}
+          📅 Date: ${{ github.event.head_commit.timestamp }}
+          
+          ### What's New
+          - Automatic build from GitHub Actions
+          - Fixed buildozer.spec with proper OpenCV support
+          - Improved Android compatibility
+          - Enhanced error handling and crash logging
+          
+          ### Installation
+          1. Download the APK below
+          2. Enable "Install from Unknown Sources" on your Android device
+          3. Install the APK
+          4. Grant all requested permissions
+          
+          ### Features
+          - ✅ Template matching with OpenCV
+          - ✅ Smart vision system
+          - ✅ Battery optimized (0.5s intervals)
+          - ✅ Floating UI overlay
+          - ✅ Auto-reset functionality
+        draft: false
+        prerelease: false
+    
+    - name: Upload APK to Release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./bin/bunnybot-${{ steps.get_version.outputs.version }}-debug.apk
+        asset_name: BunnyBot-v${{ steps.get_version.outputs.version }}-${{ github.run_number }}.apk
+        asset_content_type: application/vnd.android.package-archive
+    
+    - name: Upload APK as Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: bunnybot-apk
+        path: ./bin/*.apk
