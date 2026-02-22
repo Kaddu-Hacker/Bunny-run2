@@ -63,14 +63,20 @@ jobs:
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "Building version: $VERSION"
     
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
+    - name: Get APK filename
+      id: apk_file
+      run: |
+        APK_PATH=$(find ./bin -name "*.apk" | head -n 1)
+        echo "path=$APK_PATH" >> $GITHUB_OUTPUT
+        echo "Found APK: $APK_PATH"
+    
+    - name: Create Release and Upload APK
+      uses: softprops/action-gh-release@v2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: v${{ steps.get_version.outputs.version }}-${{ github.run_number }}
-        release_name: BunnyBot v${{ steps.get_version.outputs.version }} Build ${{ github.run_number }}
+        name: BunnyBot v${{ steps.get_version.outputs.version }} Build ${{ github.run_number }}
         body: |
           🐰 **BunnyBot Android APK**
           
@@ -98,19 +104,10 @@ jobs:
           - ✅ Auto-reset functionality
         draft: false
         prerelease: false
-    
-    - name: Upload APK to Release
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./bin/bunnybot-${{ steps.get_version.outputs.version }}-debug.apk
-        asset_name: BunnyBot-v${{ steps.get_version.outputs.version }}-${{ github.run_number }}.apk
-        asset_content_type: application/vnd.android.package-archive
+        files: ./bin/*.apk
     
     - name: Upload APK as Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: bunnybot-apk
         path: ./bin/*.apk
