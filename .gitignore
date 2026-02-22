@@ -1,0 +1,33 @@
+# Buildozer
+.buildozer/
+bin/
+*.apk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+crash_log.txt
+
+# Temporary
+*.tmp
+*.bak
+.cache/
