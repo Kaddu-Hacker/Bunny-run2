@@ -19,8 +19,8 @@ android.accept_sdk_license = True
 # Features
 android.entrypoint = org.kivy.android.PythonActivity
 android.wakelock = True
-android.bootstrap = sdl2
-android.arch = armeabi-v7a
+p4a.bootstrap = sdl2
+android.archs = armeabi-v7a
 
 # Supported orientations
 orientation = portrait
