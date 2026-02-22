@@ -52,9 +52,16 @@ jobs:
         pip install buildozer
         pip install cython
     
+    - name: Cache Buildozer global directory
+      uses: actions/cache@v4
+      with:
+        path: .buildozer
+        key: buildozer-${{ hashFiles('buildozer.spec') }}
+    
     - name: Build APK with Buildozer
+      timeout-minutes: 120
       run: |
-        buildozer android debug
+        buildozer -v android debug
     
     - name: Get version from spec
       id: get_version
