@@ -1,33 +1,18 @@
-# Buildozer
-.buildozer/
-bin/
-*.apk
+# Sensitive local files — never commit these
+config.json
+game_knowledge.json
 
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 .Python
 *.egg-info/
 dist/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+build/
+.env
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
-crash_log.txt
-
-# Temporary
-*.tmp
-*.bak
-.cache/
