@@ -7,68 +7,55 @@ import time
 
 # =============================================================================
 #
-#  BunnyBot for Termux — Part 2: Dynamic Reflex Engine
+#  BunnyBot for Termux — FINAL (Part 1 + 2 + 3)
+#  Image Capture + ZigZag Reflexes + State Machine + Ad-Dodge
 #
 #  HOW TO RUN:
-#    1. Enable Wireless Debugging in Developer Options.
-#    2. In Termux: pkg install python opencv android-tools -y
-#    3. Connect: adb connect <your_ip>:<your_port>
-#    4. Run:     python bot.py
-#
-#  CALIBRATING FOR YOUR PHONE:
-#    - Different phones have different resolutions. The key variables to
-#      adjust are ROI_LEFT, ROI_RIGHT, and the tap coordinates in COORDINATES.
-#    - Run in CALIBRATE mode first to see your screen's actual colors.
+#    1. Settings → Developer Options → Wireless Debugging → ON
+#    2. pkg install python opencv android-tools -y && pip install numpy
+#    3. adb connect <your_ip>:<your_port>
+#    4. python bot.py
 #
 # =============================================================================
 
+# --- SETTINGS ----------------------------------------------------------------
+GAME_PACKAGE  = "com.bunny.runner3D.dg"
+WATCHDOG_SECS = 60      # If stuck in any state > 60s → force reset
+ROAD_MISS_MAX = 30      # Consecutive frames with no road → assume ad/menu
 
-# --- GAME SETTINGS -----------------------------------------------------------
-GAME_PACKAGE = "com.bunny.runner3D.dg"
-
-# --- COORDINATES (Tuned for 1080x2400) ---------------------------------------
-# If your phone has a different resolution, scale these proportionally.
-# E.g. for 1080x1920: scale Y values by 1920/2400 = 0.8
+# --- COORDINATES (1080x2400 screen — scale proportionally for other sizes) ---
 COORDINATES = {
-    "START_BUTTON":     (540, 2000),  # Main menu start button
-    "TAP_LEFT":         (200, 1200),  # Where to tap to dodge left
-    "TAP_RIGHT":        (880, 1200),  # Where to tap to dodge right
-    "SCREEN_CENTER":    (540, 1200),  # Used for calibration
+    "START_BUTTON":  (540, 2000),
+    "TAP_LEFT":      (200, 1200),
+    "TAP_RIGHT":     (880, 1200),
+    "ROAD_PROBE":    (540, 1850),   # Sample point on the brown running path
 }
 
-# --- ROI (Region Of Interest) SENSOR BOXES -----------------------------------
-# Format: (x_start, y_start, x_end, y_end)
-# These define the two invisible "tripwire" boxes on screen.
-# Place them at the "knee level" of the bunny — just ahead of where
-# the bunny is running, where fences first become a threat.
-#
-# HOW TO TUNE:
-#   - On a 1080x2400 screen, the path occupies roughly x: 200-880, y: 1600-2000
-#   - Place sensors in the lower third of that running zone
-ROI_LEFT  = (200, 1750, 480, 1900)   # (x1, y1, x2, y2) — Left sensor box
-ROI_RIGHT = (600, 1750, 880, 1900)   # (x1, y1, x2, y2) — Right sensor box
+# --- ROI SENSOR BOXES (x1, y1, x2, y2) — "tripwire" zones for fences --------
+# Placed at bunny "knee level" where fences appear first.
+# Lower the Y values if the bot reacts too late.
+ROI_LEFT  = (200, 1750, 480, 1900)
+ROI_RIGHT = (600, 1750, 880, 1900)
 
 # --- HSV COLOR RANGES --------------------------------------------------------
-# White fence HSV range. Fences are bright, nearly-white objects.
-# HSV white = low Saturation, high Value.
-# Tweak FENCE_LOWER[2] (Value/Brightness) if you get false positives.
+# White fences: bright, low-saturation
 FENCE_LOWER = np.array([0,   0,   200])
 FENCE_UPPER = np.array([180, 50,  255])
 
-# --- SENSITIVITY -------------------------------------------------------------
-# Min "white pixel count" in an ROI to trigger a dodge.
-# Lower = more sensitive (will react earlier, may false-trigger on bright sky).
-# Higher = less sensitive (might miss a thin fence).
-# Start at 300 and adjust based on test runs.
-SENSITIVITY = 300
+# Brown road: warm hue, medium sat/value — tune with Calibration mode
+ROAD_LOWER  = np.array([5,   60,  60])
+ROAD_UPPER  = np.array([25,  255, 220])
 
-# Scale factor for ROI resize before processing (speeds up color masking)
-# 0.5 = shrink to half size → 4x fewer pixels to process
-RESIZE_SCALE = 0.5
+# --- TUNING VARS -------------------------------------------------------------
+SENSITIVITY  = 300      # Min white pixels in ROI to trigger dodge
+RESIZE_SCALE = 0.5      # Downscale ROIs before HSV mask (speeds up detection)
+TAP_COOLDOWN = 0.15     # Seconds between taps (prevents double-tap)
 
-# --- COOLDOWN ----------------------------------------------------------------
-# Minimum time between taps (seconds). Prevents double-tap spam on one fence.
-TAP_COOLDOWN = 0.15
+
+# === STATES ==================================================================
+STATE_MENU      = "MENU"
+STATE_PLAYING   = "PLAYING"
+STATE_RECOVERING = "RECOVERING"
 
 
 # =============================================================================
@@ -76,133 +63,119 @@ TAP_COOLDOWN = 0.15
 # =============================================================================
 
 def check_adb_connection():
-    """Verifies ADB is connected. Exits with a clear error if not."""
     output = os.popen("adb devices").read()
-    lines = output.strip().split("\n")
-    connected = any("device" in line for line in lines[1:])
+    lines  = output.strip().split("\n")
+    connected = any("device" in ln for ln in lines[1:])
     if not connected:
-        print("=" * 50)
-        print("❌  ADB is NOT connected.")
-        print("    Run: adb connect <your_ip>:<your_port>")
-        print("    (Find it in Settings > Developer Options > Wireless Debugging)")
-        print("=" * 50)
+        print("❌  ADB NOT connected. Run: adb connect <ip>:<port>")
         sys.exit(1)
-    device_id = lines[1].split()[0]
-    print(f"✅  ADB Connected: {device_id}")
-    return device_id
+    print(f"✅  ADB connected: {lines[1].split()[0]}")
 
 
 def get_screen():
-    """
-    Captures the screen, piping directly into RAM (no disk writes).
-    Returns a BGR OpenCV image, or None on failure.
-    """
+    """Captures screen directly to RAM. Returns BGR image or None."""
     try:
         pipe = subprocess.Popen(
             "adb exec-out screencap -p",
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
         img_bytes = pipe.stdout.read()
         if len(img_bytes) < 100:
             return None
-        img_array = np.frombuffer(img_bytes, np.uint8)
-        return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        return cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
     except Exception:
         return None
 
 
 def tap(x, y):
-    """Fires a raw tap into the Android system via ADB."""
     os.system(f"adb shell input tap {x} {y}")
 
 
 def get_pixel_hsv(image, x, y):
-    """Returns the HSV tuple at pixel (x, y). Useful for calibration."""
-    pixel_bgr = image[y, x]
-    pixel_arr = np.uint8([[pixel_bgr]])
-    return cv2.cvtColor(pixel_arr, cv2.COLOR_BGR2HSV)[0][0]
+    pixel = np.uint8([[image[y, x]]])
+    return cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
 
 
 # =============================================================================
-# PART 2 — THE DYNAMIC REFLEX ENGINE
+# PART 2 — ZIGZAG REFLEX ENGINE
 # =============================================================================
 
 def get_sensor_data(frame):
-    """
-    Crops the frame into Left and Right ROI boxes, applies the HSV fence mask,
-    and returns the white pixel count for each sensor after downscaling.
-
-    Returns:
-        (left_count, right_count) — number of white pixels detected in each box.
-    """
+    """Returns (left_white_count, right_white_count) for the two ROI boxes."""
     h, w = frame.shape[:2]
 
-    # Unpack ROI coordinates
-    l_x1, l_y1, l_x2, l_y2 = ROI_LEFT
-    r_x1, r_y1, r_x2, r_y2 = ROI_RIGHT
-
-    # Safety clamp to screen bounds
-    l_x1, l_x2 = max(0, l_x1), min(w, l_x2)
-    l_y1, l_y2 = max(0, l_y1), min(h, l_y2)
-    r_x1, r_x2 = max(0, r_x1), min(w, r_x2)
-    r_y1, r_y2 = max(0, r_y1), min(h, r_y2)
-
-    left_roi  = frame[l_y1:l_y2, l_x1:l_x2]
-    right_roi = frame[r_y1:r_y2, r_x1:r_x2]
-
-    def count_fence_pixels(roi):
+    def _crop_and_count(x1, y1, x2, y2):
+        x1, x2 = max(0, x1), min(w, x2)
+        y1, y2 = max(0, y1), min(h, y2)
+        roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             return 0
-        # Downscale for speed (RESIZE_SCALE controls how small)
         small = cv2.resize(roi, None, fx=RESIZE_SCALE, fy=RESIZE_SCALE,
                            interpolation=cv2.INTER_NEAREST)
-        hsv   = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        mask  = cv2.inRange(hsv, FENCE_LOWER, FENCE_UPPER)
+        mask = cv2.inRange(cv2.cvtColor(small, cv2.COLOR_BGR2HSV),
+                           FENCE_LOWER, FENCE_UPPER)
         return cv2.countNonZero(mask)
 
-    left_count  = count_fence_pixels(left_roi)
-    right_count = count_fence_pixels(right_roi)
-
-    return left_count, right_count
+    return _crop_and_count(*ROI_LEFT), _crop_and_count(*ROI_RIGHT)
 
 
 def check_obstacles(frame):
-    """
-    Reads sensor data and decides whether to dodge.
-
-    Returns:
-        'DODGE_LEFT'  — fence on the RIGHT sensor, tap left
-        'DODGE_RIGHT' — fence on the LEFT sensor, tap right
-        'CLEAR'       — nothing detected
-    """
-    left_count, right_count = get_sensor_data(frame)
-
-    if left_count > SENSITIVITY and left_count >= right_count:
-        return 'DODGE_RIGHT', left_count, right_count
-    elif right_count > SENSITIVITY:
-        return 'DODGE_LEFT', left_count, right_count
-    return 'CLEAR', left_count, right_count
+    """Returns ('DODGE_LEFT'|'DODGE_RIGHT'|'CLEAR', l_count, r_count)."""
+    l, r = get_sensor_data(frame)
+    if l > SENSITIVITY and l >= r:
+        return 'DODGE_RIGHT', l, r
+    elif r > SENSITIVITY:
+        return 'DODGE_LEFT', l, r
+    return 'CLEAR', l, r
 
 
-def render_ascii_radar(left_count, right_count, action):
-    """
-    Prints a mini ASCII radar bar to the terminal.
-    Helps you visualize what the sensors are seeing without a GUI.
+def render_ascii_radar(l, r, action, state, fps, last_dodge_secs, road_ok):
+    def bar(v):
+        n = min(int(v / SENSITIVITY * 8), 8)
+        return '#' * n + ' ' * (8 - n)
 
-      [ L: #### | R:      ] DODGE_RIGHT
-      [ L:      | R: #### ] DODGE_LEFT
-      [ L:      | R:      ] CLEAR
-    """
-    def bar(count):
-        filled = min(int(count / SENSITIVITY * 4), 8)
-        return '#' * filled + ' ' * (8 - filled)
+    road_str = "YES" if road_ok else " NO"
+    dodge_str = f"{last_dodge_secs:5.1f}s ago" if last_dodge_secs < 9999 else "never    "
+    print(
+        f"[ L:{bar(l)} | R:{bar(r)} ] {action:12s} | "
+        f"State:{state:10s} | Road:{road_str} | "
+        f"LastDodge:{dodge_str} | {fps:4.1f} FPS   ",
+        end='\r'
+    )
 
-    l_bar = bar(left_count)
-    r_bar = bar(right_count)
-    label = f" → {action}" if action != 'CLEAR' else ""
-    print(f"[ L:{l_bar} | R:{r_bar} ] {action}{label}          ", end='\r')
+
+# =============================================================================
+# PART 3 — STATE MACHINE & AD-DODGE
+# =============================================================================
+
+def is_game_running(frame):
+    """Samples ROAD_PROBE pixel. Returns True if the path brown is visible."""
+    x, y = COORDINATES["ROAD_PROBE"]
+    h, w = frame.shape[:2]
+    if y >= h or x >= w:
+        return False
+    hsv = get_pixel_hsv(frame, x, y)
+    probe_arr = np.array([[hsv]])
+    mask = cv2.inRange(probe_arr, ROAD_LOWER, ROAD_UPPER)
+    return cv2.countNonZero(mask) > 0
+
+
+def force_reset_game():
+    """Ad-Dodge: kills the game and relaunches it — bypasses unskippable ads."""
+    print("\n🔴  AD/CRASH DETECTED — Force resetting game...")
+    os.system(f"adb shell am force-stop {GAME_PACKAGE}")
+    time.sleep(1.5)
+    print("🚀  Relaunching game via monkey...")
+    os.system(f"adb shell monkey -p {GAME_PACKAGE} -c android.intent.category.LAUNCHER 1")
+    # Give splash screen time to appear before we start tapping
+    print("⏳  Waiting 7s for splash screen to load...")
+    time.sleep(7)
+
+
+def check_adb_still_alive():
+    """Lightweight ADB liveness check. Returns False if connection was dropped."""
+    output = os.popen("adb devices").read()
+    return "device" in output.split("\n")[1] if len(output.split("\n")) > 1 else False
 
 
 # =============================================================================
@@ -210,103 +183,144 @@ def render_ascii_radar(left_count, right_count, action):
 # =============================================================================
 
 def run_calibration():
-    """
-    Captures ONE frame and reports HSV colors at key coordinates.
-    Use this to tune FENCE_LOWER/FENCE_UPPER and the ROI positions.
-    """
-    print("\n" + "=" * 55)
-    print("🎨  CALIBRATION MODE")
-    print("    Open the game and make sure the bunny is running.")
-    print("=" * 55)
+    print("\n" + "="*55)
+    print("🎨  CALIBRATION MODE — Point the phone at the running game")
+    print("="*55)
     frame = get_screen()
     if frame is None:
-        print("❌  Capture failed. Check ADB connection.")
+        print("❌  Capture failed.")
         return
 
     h, w = frame.shape[:2]
-    print(f"✅  Captured frame: {w}x{h}\n")
+    print(f"✅  Frame: {w}x{h}\n")
 
     for name, (x, y) in COORDINATES.items():
         if y < h and x < w:
             hsv = get_pixel_hsv(frame, x, y)
-            print(f"  {name:20s} ({x:4d},{y:4d}) → HSV [{hsv[0]:3d}, {hsv[1]:3d}, {hsv[2]:3d}]")
+            print(f"  {name:16s} ({x:4d},{y:4d}) → HSV [{hsv[0]:3d}, {hsv[1]:3d}, {hsv[2]:3d}]")
         else:
-            print(f"  {name:20s} ({x:4d},{y:4d}) → OUT OF BOUNDS")
+            print(f"  {name:16s} ({x:4d},{y:4d}) → OUT OF BOUNDS")
 
-    # Also show current sensor readings
-    l_count, r_count = get_sensor_data(frame)
-    print(f"\n  LEFT  sensor white pixels  : {l_count}  (SENSITIVITY = {SENSITIVITY})")
-    print(f"  RIGHT sensor white pixels  : {r_count}  (SENSITIVITY = {SENSITIVITY})")
-    print("\nRun again on the game screen while a fence is visible")
-    print("to find the right SENSITIVITY value.")
-    print("=" * 55 + "\n")
+    l, r = get_sensor_data(frame)
+    road = is_game_running(frame)
+    print(f"\n  LEFT  sensor white px : {l}   (vs SENSITIVITY={SENSITIVITY})")
+    print(f"  RIGHT sensor white px : {r}   (vs SENSITIVITY={SENSITIVITY})")
+    print(f"  Road detected (brown) : {'YES ✅' if road else 'NO ❌  — tune ROAD_LOWER/ROAD_UPPER'}")
+    print("="*55 + "\n")
 
 
 # =============================================================================
-# MAIN GAME LOOP
+# MAIN BOT LOOP
 # =============================================================================
 
 def main():
-    print("\n🐰  BunnyBot — Part 2: Dynamic Reflex Engine")
-    print("=" * 45)
+    print("\n🐰  BunnyBot — Final (Part 1 + 2 + 3)")
+    print("="*42)
     check_adb_connection()
-    print(f"    Sensitivity : {SENSITIVITY} pixels")
-    print(f"    Cooldown    : {TAP_COOLDOWN}s")
-    print(f"    ROI Left    : {ROI_LEFT}")
-    print(f"    ROI Right   : {ROI_RIGHT}")
 
-    mode = input("\nMode? [1] Run Bot  [2] Calibration  → ").strip()
+    mode = input("\n[1] Run Bot   [2] Calibrate   → ").strip()
     if mode == "2":
         run_calibration()
         return
 
-    print("\n✅  Bot armed! Switch to the game. Starting in 5 seconds...")
+    print("\n✅  Armed! Switch to the game — starting in 5 seconds...")
     time.sleep(5)
 
-    last_tap_time = 0.0
-    state = "MENU"
-    frame_count = 0
+    state           = STATE_MENU
+    state_entered   = time.time()
+    last_tap_time   = 0.0
+    last_dodge_time = 9999.0
+    road_miss_count = 0
+    frame_count     = 0
 
     while True:
         loop_start = time.time()
 
+        # --- ADB liveness watchdog ---
+        if frame_count % 60 == 0 and not check_adb_still_alive():
+            print("\n⚠️   ADB connection dropped — waiting 5s then retrying...")
+            time.sleep(5)
+            if not check_adb_still_alive():
+                print("❌  ADB still down. Exiting.")
+                sys.exit(1)
+
         frame = get_screen()
         if frame is None:
-            time.sleep(0.05)
+            time.sleep(0.1)
             continue
 
-        if state == "MENU":
-            # Tap the start button location every second until we start moving
-            cx, cy = COORDINATES["START_BUTTON"]
-            tap(cx, cy)
-            print("🕹️   Waiting for game start...                          ", end='\r')
-            time.sleep(1.0)
-            state = "PLAYING"
-            print("\n🎮  Switched to PLAYING state!")
+        frame_count += 1
+        now = time.time()
 
-        elif state == "PLAYING":
+        # --- Watchdog: stuck-state protection ---
+        if now - state_entered > WATCHDOG_SECS:
+            print(f"\n⏱️   WATCHDOG: Stuck in {state} for {WATCHDOG_SECS}s — forcing reset")
+            force_reset_game()
+            state         = STATE_MENU
+            state_entered = now
+            road_miss_count = 0
+            continue
+
+        # =====================================================================
+        # STATE MACHINE
+        # =====================================================================
+
+        if state == STATE_MENU:
+            # Blind-tap the start button every 3 seconds until road appears
+            if now - last_tap_time > 3.0:
+                tx, ty = COORDINATES["START_BUTTON"]
+                tap(tx, ty)
+                last_tap_time = now
+                print("🕹️   Tapping START...                                  ", end='\r')
+
+            if is_game_running(frame):
+                print("\n🟢  Road detected! Switching to PLAYING...")
+                state         = STATE_PLAYING
+                state_entered = now
+                road_miss_count = 0
+
+        elif state == STATE_PLAYING:
+            road_ok = is_game_running(frame)
+
+            if road_ok:
+                road_miss_count = 0
+            else:
+                road_miss_count += 1
+
+            # If road is gone for too many consecutive frames → ad/game-over
+            if road_miss_count >= ROAD_MISS_MAX:
+                print(f"\n🔴  Road lost for {ROAD_MISS_MAX} frames → switching to RECOVERING")
+                state         = STATE_RECOVERING
+                state_entered = now
+                road_miss_count = 0
+                continue
+
+            # Run the ZigZag reflex engine
             action, l_count, r_count = check_obstacles(frame)
-            render_ascii_radar(l_count, r_count, action)
 
-            now = time.time()
             if action != 'CLEAR' and (now - last_tap_time) > TAP_COOLDOWN:
                 if action == 'DODGE_RIGHT':
                     tap(*COORDINATES["TAP_RIGHT"])
-                elif action == 'DODGE_LEFT':
+                else:
                     tap(*COORDINATES["TAP_LEFT"])
-                last_tap_time = now
+                last_tap_time  = now
+                last_dodge_time = now
 
-        frame_count += 1
-        elapsed = time.time() - loop_start
-        fps = 1.0 / elapsed if elapsed > 0 else 0
+            elapsed = time.time() - loop_start
+            fps = 1.0 / elapsed if elapsed > 0 else 0
+            dodge_ago = now - last_dodge_time if last_dodge_time != 9999.0 else 9999
+            render_ascii_radar(l_count, r_count, action, state, fps, dodge_ago, road_ok)
 
-        if frame_count % 30 == 0:
-            print(f"\n  ⚡ {fps:.1f} FPS | Frames: {frame_count}                   ")
+        elif state == STATE_RECOVERING:
+            force_reset_game()
+            state         = STATE_MENU
+            state_entered = time.time()
+            last_tap_time = 0.0
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n🛑  Bot stopped by user (CTRL+C). Bye!")
+        print("\n\n🛑  Stopped by user (CTRL+C). Bye!")
         sys.exit(0)
