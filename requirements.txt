@@ -4,11 +4,12 @@
 #  ⚠️  DO NOT use `pip install opencv-python` in Termux.
 #  It will try to compile OpenCV from C++ source and hang.
 #
-#  Instead, install via pkg (pre-compiled binaries):
+#  Instead, install via pkg (the fast way):
 #
-#    pkg install python-numpy python-opencv
+#    pkg install tur-repo
+#    pkg install opencv
 #
-#  Then this app has NO pip dependencies.
+#  This will install both numpy and opencv for Python.
 #  If you still want to use pip for numpy only:
 #
 #    pip install numpy

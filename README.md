@@ -36,9 +36,14 @@ pkg update && pkg upgrade -y
 # 2. Install Python, Git, and ADB
 pkg install python git android-tools -y
 
-# 3. Install numpy and OpenCV (pre-compiled Termux packages — fast!)
-pkg install python-numpy python-opencv -y
+# 3. Enable the TUR repo and install OpenCV (the most reliable way)
+pkg install tur-repo -y
+pkg up
+pkg install opencv -y
 ```
+
+> 💡 **Why `opencv` instead of `python-opencv`?**  
+> In many Termux versions, the package is just called `opencv`. Installing it after adding the `tur-repo` ensures you get the high-speed Python bindings automatically.
 
 > ⚠️ **DO NOT run `pip install opencv-python`** — it tries to compile OpenCV from C++ source
 > and will hang for hours. The `pkg install python-opencv` command above gives you the same

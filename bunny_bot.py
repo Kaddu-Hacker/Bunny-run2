@@ -19,7 +19,8 @@ else:
 #
 #  QUICK START (copy-paste into Termux):
 #    pkg update && pkg upgrade -y
-#    pkg install python git android-tools python-numpy python-opencv -y
+#    pkg install python git android-tools tur-repo -y
+#    pkg install opencv -y
 #    termux-setup-storage
 #    ⚠️  Do NOT use: pip install opencv-python  (it hangs compiling C++ source)
 #
