@@ -12,15 +12,8 @@ else:
     import numpy as np  # noqa: F401
 
 # =============================================================================
-#  BunnyBot — Remote Control Edition
+#  BunnyBot — Tap Precision Edition
 #  Termux + Wireless ADB | Multi-Device Support
-#
-#  SETUP:
-#    pkg update && pkg upgrade -y
-#    pkg install x11-repo -y
-#    pkg install dbus libx11 android-tools git python -y
-#    pkg install opencv -y
-#    apt install opencv-python -y
 # =============================================================================
 
 PACKAGE_NAME  = "com.bunny.runner3D.dg"
@@ -29,7 +22,7 @@ ROAD_MISS_MAX = 30
 
 def main_menu():
     config = {
-        "device_id":     "",     # IP:PORT for remote phone. Empty for local/default.
+        "device_id":     "",     
         "sensitivity":   500,    
         "white_level":   220,    
         "ad_level":      240,    
@@ -41,7 +34,7 @@ def main_menu():
     while True:
         os.system("clear")
         print("╔══════════════════════════════════════════════╗")
-        print("║  🐰  BUNNY RUNNER 3D — REMOTE EDITION 🐰   ║")
+        print("║  🐰  BUNNY RUNNER 3D — TAP EDITION 🐰      ║")
         print("╠══════════════════════════════════════════════╣")
         dev_display = config['device_id'] if config['device_id'] else "Local/Default"
         print(f"║  1. Target Device  : {dev_display:<18} ║")
@@ -77,12 +70,10 @@ def main_menu():
             print(f"   Target : {config['device_id'] if config['device_id'] else 'Local Device'}")
             print("\nSwitch to Bunny Runner NOW!")
             print("Bot will take control in 10 seconds...")
-            time.sleep(10) # Increased delay to 10 seconds
+            time.sleep(10) 
             return config
         elif choice == 'Q':
             sys.exit(0)
-
-    return config
 
 class BunnyBot:
     def __init__(self, config: dict):
@@ -97,18 +88,21 @@ class BunnyBot:
 
         self._get_resolution()
 
-        self.left_roi  = (int(self.h * 0.80), int(self.h * 0.85),
-                          int(self.w * 0.10), int(self.w * 0.40))
-        self.right_roi = (int(self.h * 0.80), int(self.h * 0.85),
-                          int(self.w * 0.60), int(self.w * 0.90))
+        # SENSORS: Placed higher (65-75% height) to see fences early
+        self.left_roi  = (int(self.h * 0.65), int(self.h * 0.75),
+                          int(self.w * 0.10), int(self.w * 0.45))
+        self.right_roi = (int(self.h * 0.65), int(self.h * 0.75),
+                          int(self.w * 0.55), int(self.w * 0.90))
 
-        self.tap_left   = (int(self.w * 0.20), int(self.h * 0.50))
-        self.tap_right  = (int(self.w * 0.80), int(self.h * 0.50))
-        self.tap_start  = (self.w // 2,        int(self.h * 0.80))
-        self.road_probe = (self.w // 2,        int(self.h * 0.80))
+        # Action Coordinates
+        self.tap_left      = (int(self.w * 0.20), int(self.h * 0.50))
+        self.tap_right     = (int(self.w * 0.80), int(self.h * 0.50))
+        self.tap_try_again = (self.w // 2,        int(self.h * 0.50)) # Dead Center
+        self.tap_start     = (self.w // 2,        int(self.h * 0.85)) # Bottom
+        
+        self.road_probe = (self.w // 2, int(self.h * 0.85))
 
     def _adb_cmd(self, command: str) -> str:
-        """Injects the target device ID if provided."""
         dev_flag = f"-s {self.config['device_id']} " if self.config['device_id'] else ""
         return f"adb {dev_flag}{command}"
 
@@ -119,7 +113,7 @@ class BunnyBot:
             size_part = raw.split(":")[-1].strip()
             self.w, self.h = map(int, size_part.split("x"))
         except Exception:
-            print(f"❌ Could not connect to device: {self.config['device_id'] if self.config['device_id'] else 'Local'}")
+            print(f"❌ ADB Error: Could not get resolution. Check connection.")
             sys.exit(1)
 
     def get_frame(self):
@@ -128,32 +122,16 @@ class BunnyBot:
             pipe = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             if pipe.stdout is None: return None
             data: bytes = cast(bytes, pipe.stdout.read())
-            
-            if len(data) < 1000: # File too small, screencap failed
-                return None
-                
+            if len(data) < 1000: return None
             frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
-            
-            # THE "BLINDNESS" FIX: If the screen is pitch black, ADB capture failed or screen is off.
-            if frame is None or np.mean(frame) < 5:
-                return None
-                
+            if frame is None or np.mean(frame) < 5: return None
             return frame
         except Exception:
             return None
 
-    def _check_adb_alive(self) -> bool:
-        try:
-            cmd = "adb devices"
-            out = os.popen(cmd).read()
-            target = self.config['device_id'] if self.config['device_id'] else "device"
-            return target in out
-        except Exception:
-            return False
-
-    def tap(self, x, y):
+    def tap(self, x, y, cooldown=True):
         now = time.time()
-        if now - self.last_tap_time < self.config["tap_cooldown"]:
+        if cooldown and (now - self.last_tap_time < self.config["tap_cooldown"]):
             return
         cmd = self._adb_cmd(f"shell input tap {int(x)} {int(y)}")
         os.system(cmd)
@@ -177,64 +155,40 @@ class BunnyBot:
 
     def _is_game_running(self, frame):
         px, py = self.road_probe
-        if py >= frame.shape[0] or px >= frame.shape[1]:
-            return False
-        
+        if py >= frame.shape[0] or px >= frame.shape[1]: return False
         val = int(frame[py, px])
-        # It must be darker than road_dark_max, but brighter than 5 (not pure black)
         return 5 < val < self.config["road_dark_max"]
 
     def _force_reset_game(self):
         if not self.config["reset_ads"]:
-            print("\n⚠️ Ad detected. Waiting 35 seconds...")
+            print("\n⚠️ Ad detected. Waiting...")
             time.sleep(35)
             return
-            
         print("\n🔴 AD/FREEZE DETECTED — Force resetting...")
-        cmd_stop = self._adb_cmd(f"shell am force-stop {PACKAGE_NAME}")
-        os.system(cmd_stop)
+        os.system(self._adb_cmd(f"shell am force-stop {PACKAGE_NAME}"))
         time.sleep(1.5)
-        
-        cmd_start = self._adb_cmd(f"shell monkey -p {PACKAGE_NAME} -c android.intent.category.LAUNCHER 1")
-        os.system(cmd_start)
-        print("🚀 Relaunched. Waiting 10s for splash screen...")
+        os.system(self._adb_cmd(f"shell monkey -p {PACKAGE_NAME} -c android.intent.category.LAUNCHER 1"))
         time.sleep(10)
 
     def _render_radar(self, l, r, action, fps):
         def bar(v):
             n = min(int(v / max(self.config["sensitivity"], 1) * 8), 8)
             return '#' * n + ' ' * (8 - n)
-        
         tgt = self.config['device_id'] if self.config['device_id'] else 'Local'
-        print(
-            f"[{tgt}] [ L:{bar(l)} | R:{bar(r)} ] {action:12s} | "
-            f"{self.state:10s} | FPS:{fps:4.1f}    ",
-            end='\r'
-        )
+        print(f"[{tgt}] [ L:{bar(l)} | R:{bar(r)} ] {action:12s} | {self.state:10s} | FPS:{fps:4.1f}    ", end='\r')
 
     def start_loop(self) -> None:
         frame_count: int = 0
-
         while True:
             loop_start = time.time()
-
-            if (frame_count % 60) == 0 and not self._check_adb_alive():
-                print("\n⚠️ Target device lost. Waiting 5s...")
-                time.sleep(5)
-                continue
-
             if time.time() - self.state_entered > WATCHDOG_SECS:
-                print(f"\n⏱️ WATCHDOG fired in {self.state} — forcing reset")
                 self._force_reset_game()
-                self.state         = "MENU"
+                self.state = "MENU"
                 self.state_entered = time.time()
-                self.road_miss     = 0
                 continue
 
             frame = self.get_frame()
             if frame is None:
-                # If frame is None, screencap failed or returned black.
-                print("⚠️ Warning: Screen capture failed or screen is off.", end='\r')
                 time.sleep(0.5)
                 continue
 
@@ -242,26 +196,27 @@ class BunnyBot:
             now = time.time()
 
             if self.state == "MENU":
-                self._last_road_ok = self._is_game_running(frame)
-                if self._last_road_ok:
+                if self._is_game_running(frame):
                     print("\n🟢 Road detected — PLAYING!")
-                    self.state         = "PLAYING"
+                    self.state = "PLAYING"
                     self.state_entered = now
-                    self.road_miss     = 0
                 else:
                     if now - self.last_tap_time > 2.0:
-                        self.tap(*self.tap_start)
-                        print("🕹️ Tapping Start...                              ", end='\r')
+                        # Try both common button locations (Try Again & Start)
+                        self.tap(*self.tap_try_again, cooldown=False)
+                        time.sleep(0.2)
+                        self.tap(*self.tap_start, cooldown=False)
+                        print("🕹️ Searching for Start/Try Again...            ", end='\r')
 
             elif self.state == "PLAYING":
                 self._last_road_ok = self._is_game_running(frame)
                 self.road_miss = 0 if self._last_road_ok else self.road_miss + 1
 
-                cx, cy        = self.w // 2, int(self.h * 0.8)
+                cx, cy = self.road_probe
                 center_bright = int(frame[cy, cx]) if cy < frame.shape[0] else 0
 
                 if center_bright > self.config["ad_level"] or self.road_miss >= ROAD_MISS_MAX:
-                    self.state         = "RECOVERING"
+                    self.state = "RECOVERING"
                     self.state_entered = now
                     continue
 
@@ -272,20 +227,18 @@ class BunnyBot:
                     self.tap(*self.tap_left)
 
                 elapsed = time.time() - loop_start
-                fps     = 1.0 / elapsed if elapsed > 0 else 0
+                fps = 1.0 / elapsed if elapsed > 0 else 0
                 self._render_radar(l, r, action, fps)
 
             elif self.state == "RECOVERING":
                 self._force_reset_game()
-                self.state         = "MENU"
+                self.state = "MENU"
                 self.state_entered = time.time()
-                self.road_miss     = 0
 
 if __name__ == "__main__":
     try:
-        config = main_menu()
-        bot    = BunnyBot(config)
-        bot.start_loop()
+        cfg = main_menu()
+        if cfg: BunnyBot(cfg).start_loop()
     except KeyboardInterrupt:
-        print("\n\n🛑 Bot stopped. Bye! 🐰")
+        print("\n\n🛑 Bot stopped. 🐰")
         sys.exit(0)
