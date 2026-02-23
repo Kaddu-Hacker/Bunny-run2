@@ -60,25 +60,37 @@ termux-setup-storage
 
 1. Go to **Settings → About Phone** and tap **Build Number** 7 times to unlock Developer Options.
 2. Go to **Settings → Developer Options → Wireless Debugging** and turn it **ON** (stay connected to WiFi).
-3. Tap **"Pair device with pairing code"** — note the **IP:PairPort** and the **6-digit code**.
+3. **CRITICAL — THE TWO PORTS:**
+   - **Main Screen:** Shows your IP and the **CONNECTION PORT** (e.g., `192.168.1.5:44321`).
+   - **Inside "Pair device":** Tap it to see the **PAIRING PORT** (e.g., `192.168.1.5:33455`) and the **6-digit code**.
 
 ---
 
 ### Step 4 — Connect ADB in Termux
 
-```bash
-# Step A: Pair first (enter the 6-digit code when prompted)
-adb pair <IP>:<PairPort>
+If `adb pair` gives an error like **"protocol fault"**, first run:  
+`adb kill-server`  
+Then try again.
 
-# Step B: Now connect using the MAIN port shown on the Wireless Debugging screen
-adb connect <IP>:<MainPort>
+#### Part A: Pair (Use the PAIRING Port)
+Tap "Pair device with pairing code" on your phone. In Termux, type:
+```bash
+adb pair <IP>:<Pairing_Port>
+```
+Enter the **6-digit code** when asked. It should say "Successfully paired".
+
+#### Part B: Connect (Use the CONNECTION Port)
+Now look at the **MAIN Wireless Debugging screen** for the Port shown under "IP address & Port". This is usually different from the pairing port!
+```bash
+adb connect <IP>:<Connection_Port>
 ```
 
-A popup appears on your phone — tap **Always Allow**.  
-Verify it worked:
+> 💡 **The Popup:** Only *after* you run the `connect` command will a popup appear on your phone asking to "Allow USB Debugging?". Tap **Always Allow**.
+
+#### Part C: Verify
 ```bash
 adb devices
-# Should show: 192.168.x.x:PORT    device
+# Success looks like: 192.168.x.x:PORT    device
 ```
 
 ---
