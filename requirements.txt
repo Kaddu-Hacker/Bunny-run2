@@ -1,20 +1,30 @@
 # ============================================================
-#  BunnyBot — Termux Package Requirements
-#  
-#  ⚠️  DO NOT use `pip install opencv-python` in Termux.
-#  It will try to compile OpenCV from C++ source and hang.
-#
-#  Instead, install via pkg (the fast way):
-#
-#    pkg install tur-repo
-#    pkg install opencv
-#
-#  This will install both numpy and opencv for Python.
-#  If you still want to use pip for numpy only:
-#
-#    pip install numpy
-#
+#  BunnyBot — Python Dependencies
+#  Compatible with Termux (Android) and standard Linux/Mac/Windows
 # ============================================================
 
-# One-liner install command (copy-paste into Termux):
-# pkg install python-numpy python-opencv
+# ── Install via pip (works natively on Termux) ──────────────
+google-generativeai>=0.5.0
+
+# ── Optional: Faster image handling for AI (install if available) ──
+# pip install Pillow
+# Pillow is optional — the bot will work without it (falls back to base64 encoding)
+
+# ── OpenCV + NumPy: MUST be installed via pkg in Termux ─────
+#
+#   DO NOT run:  pip install opencv-python   ← will try to compile C++, will hang!
+#
+#   Instead run these ONE TIME in Termux:
+#     pkg install python-numpy
+#     pkg install opencv-python
+#
+#   These provide both numpy and cv2 without any compilation.
+#   The pixel-reflex feature (fast obstacle detection) requires these.
+#   If not installed, the bot will still work using AI-only mode.
+#
+# ── ADB (Android Debug Bridge) ──────────────────────────────
+#
+#   In Termux, ADB is installed via:
+#     pkg install android-tools
+#
+# ============================================================
