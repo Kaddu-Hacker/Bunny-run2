@@ -27,19 +27,25 @@ No APK, No Root, No PC required.
 
 ### Step 2 — Install All Tools
 
-Open Termux and paste these commands one at a time:
+Open Termux and paste **each line one at a time**:
 
 ```bash
-# 1. Update everything first
+# 1. Update package lists
 pkg update && pkg upgrade -y
 
-# 2. Install Python, OpenCV build tools, and ADB
-pkg install python ndk-sysroot clang make libjpeg-turbo opencv android-tools git -y
+# 2. Install Python, Git, and ADB
+pkg install python git android-tools -y
 
-# 3. Install Python packages
-pip install numpy opencv-python
+# 3. Install numpy and OpenCV (pre-compiled Termux packages — fast!)
+pkg install python-numpy python-opencv -y
+```
 
-# 4. Grant Termux access to your storage
+> ⚠️ **DO NOT run `pip install opencv-python`** — it tries to compile OpenCV from C++ source
+> and will hang for hours. The `pkg install python-opencv` command above gives you the same
+> library as a pre-built binary, installing in seconds.
+
+```bash
+# 4. Grant storage access (a popup will appear — tap Allow)
 termux-setup-storage
 ```
 

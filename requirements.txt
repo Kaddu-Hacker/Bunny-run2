@@ -1,4 +1,19 @@
-# Python packages required to run bunny_bot.py in Termux
-# Install with: pip install -r requirements.txt
-numpy
-opencv-python
+# ============================================================
+#  BunnyBot — Termux Package Requirements
+#  
+#  ⚠️  DO NOT use `pip install opencv-python` in Termux.
+#  It will try to compile OpenCV from C++ source and hang.
+#
+#  Instead, install via pkg (pre-compiled binaries):
+#
+#    pkg install python-numpy python-opencv
+#
+#  Then this app has NO pip dependencies.
+#  If you still want to use pip for numpy only:
+#
+#    pip install numpy
+#
+# ============================================================
+
+# One-liner install command (copy-paste into Termux):
+# pkg install python-numpy python-opencv
