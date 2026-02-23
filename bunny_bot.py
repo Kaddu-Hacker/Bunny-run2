@@ -96,9 +96,10 @@ def _call_openrouter(api_key: str, prompt: str, frame_b64: str | None = None) ->
     content.append({"type": "text", "text": prompt})
 
     payload = {
-        "max_tokens": 60,
+        "model":       OPENROUTER_MDL,
+        "max_tokens":  60,
         "temperature": 0.2,
-        "messages": [{"role": "user", "content": content}],
+        "messages":    [{"role": "user", "content": content}],
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -123,7 +124,7 @@ def _call_openrouter(api_key: str, prompt: str, frame_b64: str | None = None) ->
         return None
 
 def _call_google(api_key: str, prompt: str, frame_b64: str | None = None) -> str | None:
-    parts = []
+    parts: list[dict] = []
     if frame_b64:
         parts.append({"inline_data": {"mime_type": "image/png", "data": frame_b64}})
     parts.append({"text": prompt})
@@ -185,7 +186,8 @@ def phase1_learn_game(cfg: dict, frame_bytes: bytes, kb: dict):
         return
 
     summary, rules = "", []
-    for line in result.splitlines():
+    lines = result.splitlines()
+    for line in lines:
         line = line.strip()
         if line.startswith("SUMMARY:"):
             summary = line[8:].strip()
@@ -214,7 +216,8 @@ def phase3_consolidate(cfg: dict, kb: dict):
     )
     result = call_ai(cfg, prompt)
     if result and result.strip().upper() != "NONE":
-        new_rules = [l[2:].strip() for l in result.splitlines() if l.strip().startswith("- ")]
+        lines = result.splitlines()
+        new_rules = [l[2:].strip() for l in lines if l.strip().startswith("- ")]
         if new_rules:
             kb["rules"].extend(new_rules)
             print(f"✅ Added {len(new_rules)} new rules to knowledge base!")
@@ -304,6 +307,7 @@ def main_menu(cfg: dict, kb: dict) -> dict:
             return cfg
         elif choice == "Q":
             sys.exit(0)
+    return cfg  # Unreachable but satisfies linter
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BOT CLASS
@@ -311,6 +315,7 @@ def main_menu(cfg: dict, kb: dict) -> dict:
 
 class BunnyBotAI:
     def __init__(self, config: dict, kb: dict):
+        self.w, self.h    = 0, 0
         self.config       = config
         self.kb           = kb
         self.game_state   = "UNKNOWN"
