@@ -3,28 +3,32 @@
 #  Compatible with Termux (Android) and standard Linux/Mac/Windows
 # ============================================================
 
-# ── Install via pip (works natively on Termux) ──────────────
+# ── Install via pip (all work natively on Termux) ───────────
+
+# OpenRouter API client (OpenAI-compatible, used for Gemini 3.1 Pro)
+openai>=1.0.0
+
+# Google AI Studio client (fallback — Gemini 1.5 Flash)
 google-generativeai>=0.5.0
 
-# ── Optional: Faster image handling for AI (install if available) ──
+# ── Optional: faster image handling for AI ───────────────────
 # pip install Pillow
-# Pillow is optional — the bot will work without it (falls back to base64 encoding)
+# Without Pillow, images are sent as base64 (still works fine)
 
 # ── OpenCV + NumPy: MUST be installed via pkg in Termux ─────
 #
-#   DO NOT run:  pip install opencv-python   ← will try to compile C++, will hang!
+#   ⚠️  DO NOT run:  pip install opencv-python
+#       It will try to compile C++ and hang/fail on Termux!
 #
-#   Instead run these ONE TIME in Termux:
+#   Instead, run these ONE TIME in Termux:
 #     pkg install python-numpy
 #     pkg install opencv-python
 #
-#   These provide both numpy and cv2 without any compilation.
-#   The pixel-reflex feature (fast obstacle detection) requires these.
-#   If not installed, the bot will still work using AI-only mode.
+#   These provide numpy and cv2 for the pixel-reflex feature.
+#   Without them, the bot runs in AI-only mode (still works).
 #
 # ── ADB (Android Debug Bridge) ──────────────────────────────
 #
-#   In Termux, ADB is installed via:
-#     pkg install android-tools
+#   pkg install android-tools
 #
 # ============================================================
