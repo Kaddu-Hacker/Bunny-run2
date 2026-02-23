@@ -137,11 +137,34 @@ To stop: **CTRL+C**
 
 ---
 
+## ❓ Pairing Code Keeps Changing?
+
+The code and port reset every time you navigate away from the "Pair device" dialog. Use one of these two tricks:
+
+### ✅ Method 1 — Split Screen (Easiest)
+1. Open both **Termux** and **Settings** (Wireless Debugging on).
+2. Long-press the **Recents button** → tap the Termux window title → choose **Split screen**.
+3. Pick **Settings** for the bottom half.
+4. Tap **"Pair device with pairing code"** in Settings (bottom half).
+5. The port and code are visible — tap Termux (top half) and type `adb pair IP:PORT` while looking at the code below.
+6. Enter the 6-digit code without ever switching screens. ✅
+
+### ✅ Method 2 — Pre-Type
+1. In Termux, type `adb pair 192.168.` but **don't press Enter yet**.
+2. Switch to Settings → tap "Pair device" → quickly note the rest of the IP, port, and 6-digit code.
+3. Switch back to Termux — your partial command is still there — finish typing and press Enter.
+4. When it asks `Enter pairing code:` → type the 6 digits.
+
+> 💡 **Good news:** Once you successfully pair, you **never need to pair again** — even after reboots. Only `adb connect` is needed next time.
+
+---
+
 ## 🐛 Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `ADB not connected` | Re-run `adb pair` then `adb connect` |
+| `protocol fault` during pairing | Run `adb kill-server` first, then retry |
+| `ADB not connected` | Re-run `adb connect <IP>:<Connection_Port>` |
 | Bot not reacting to fences | Lower **Sensitivity** (try 200) or lower **White Level** (try 190) |
 | Bot tap-spamming on road | Raise **Sensitivity** (try 800) or raise **White Level** (try 230) |
 | Ad-Dodge not firing | Lower **Ad Level** in code to 220 |
