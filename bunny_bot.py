@@ -1,9 +1,16 @@
 import subprocess
-import cv2
-import numpy as np
 import time
 import os
 import sys
+from typing import cast, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Only used for type-checking (IDE). At runtime Termux has these installed.
+    import cv2  # type: ignore[import]
+    import numpy as np  # type: ignore[import]
+else:
+    import cv2  # noqa: F401
+    import numpy as np  # noqa: F401
 
 # =============================================================================
 #
@@ -84,6 +91,9 @@ def main_menu():
             print("Bye! 🐰")
             sys.exit(0)
 
+    # Fallback — should never reach here, but satisfies the type checker
+    return config
+
 
 # ==================== MAIN BOT CLASS ========================================
 
@@ -95,6 +105,9 @@ class BunnyBot:
         self.state_entered = time.time()
         self.road_miss     = 0
         self._last_road_ok = False
+        # Declared here so the type-checker knows they exist before _get_resolution sets them
+        self.w: int        = 0
+        self.h: int        = 0
 
         self._get_resolution()
 
@@ -143,17 +156,21 @@ class BunnyBot:
                 "adb exec-out screencap -p",
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
-            data = pipe.stdout.read()
+            if pipe.stdout is None:
+                return None
+            data: bytes = cast(bytes, pipe.stdout.read())
             if len(data) < 100:
                 return None
             return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
         except Exception:
             return None
 
-    def _check_adb_alive(self):
+    def _check_adb_alive(self) -> bool:
         try:
-            out = os.popen("adb devices").read()
-            return any("device" in ln for ln in out.strip().split("\n")[1:])
+            out: str = os.popen("adb devices").read()
+            lines: list = out.strip().split("\n")
+            rest = lines[1:]  # type: ignore[misc]
+            return any("device" in ln for ln in rest)
         except Exception:
             return False
 
@@ -227,14 +244,14 @@ class BunnyBot:
 
     # ── MAIN LOOP ─────────────────────────────────────────────────────────────
 
-    def start_loop(self):
-        frame_count = 0
+    def start_loop(self) -> None:
+        frame_count: int = 0
 
         while True:
             loop_start = time.time()
 
             # ADB liveness check every 60 frames
-            if frame_count % 60 == 0 and not self._check_adb_alive():
+            if (frame_count % 60) == 0 and not self._check_adb_alive():  # type: ignore[operator]
                 print("\n⚠️   ADB connection dropped — waiting 5s...")
                 time.sleep(5)
                 if not self._check_adb_alive():
@@ -255,7 +272,7 @@ class BunnyBot:
                 time.sleep(0.05)
                 continue
 
-            frame_count += 1
+            frame_count = frame_count + 1  # type: ignore[operator]
             now = time.time()
 
             # ── MENU ─────────────────────────────────────────────────────────
