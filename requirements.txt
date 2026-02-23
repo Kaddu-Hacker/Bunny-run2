@@ -1,34 +1,33 @@
 # ============================================================
 #  BunnyBot — Python Dependencies
-#  Compatible with Termux (Android) and standard Linux/Mac/Windows
+#  ✅ Termux-safe: all install via pip with NO Rust compilation
 # ============================================================
 
-# ── Install via pip (all work natively on Termux) ───────────
+# Core HTTP client — used for ALL AI API calls (OpenRouter + Google)
+# Pure Python, no Rust, installs instantly on Termux
+requests>=2.28.0
 
-# OpenRouter API client (OpenAI-compatible, used for Gemini 3.1 Pro)
-openai>=1.0.0
-
-# Google AI Studio client (fallback — Gemini 1.5 Flash)
-google-generativeai>=0.5.0
-
-# ── Optional: faster image handling for AI ───────────────────
+# ── Optional: faster image handling ─────────────────────────
 # pip install Pillow
-# Without Pillow, images are sent as base64 (still works fine)
+# Not required — images are already sent as base64 via requests
 
-# ── OpenCV + NumPy: MUST be installed via pkg in Termux ─────
+# ── OpenCV + NumPy: install via pkg (NOT pip) in Termux ─────
+#   ⚠️  DO NOT run: pip install opencv-python
+#       It compiles C++ and hangs on Termux!
 #
-#   ⚠️  DO NOT run:  pip install opencv-python
-#       It will try to compile C++ and hang/fail on Termux!
-#
-#   Instead, run these ONE TIME in Termux:
+#   Run these ONCE in Termux instead:
 #     pkg install python-numpy
 #     pkg install opencv-python
 #
-#   These provide numpy and cv2 for the pixel-reflex feature.
-#   Without them, the bot runs in AI-only mode (still works).
+#   These enable pixel-reflex fast obstacle detection.
+#   Without them, bot runs in AI-only mode (still works fine).
 #
-# ── ADB (Android Debug Bridge) ──────────────────────────────
-#
+# ── ADB ──────────────────────────────────────────────────────
 #   pkg install android-tools
 #
+# ── Full Termux quick-start ──────────────────────────────────
+#   pkg update && pkg upgrade -y
+#   pkg install python android-tools python-numpy opencv-python -y
+#   pip install requests
+#   python bunny_bot.py
 # ============================================================
