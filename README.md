@@ -1,41 +1,79 @@
-# 🐰 BunnyBot — Termux + ADB Edition
+# 🐰 BunnyBot — Termux + Wireless ADB Edition
 
-Fully autonomous Bunny Runner 3D bot running inside **Termux** via **Wireless ADB**. No APK, no Root, no PC.
+Fully autonomous Bunny Runner 3D bot running inside **Termux** on your Android phone.  
+No APK, No Root, No PC required.
 
 ---
 
 ## ✨ How It Works
 
-- **Auto-Resolution** — reads your phone's screen size via `adb shell wm size`. No manual pixel math.
-- **RAM-Speed Capture** — pipes `screencap` directly into a NumPy array (no SD card writes).
-- **Grayscale Sensors** — two "tripwire" ROI boxes count bright pixels for fence detection instantly.
-- **Full State Machine** — `MENU → PLAYING → RECOVERING` with Watchdog and ADB liveness check.
-- **Ad-Dodge** — force-kills + monkey-relaunches the game, skipping 30s ads in ~4 seconds.
-- **Pre-Flight Menu** — configure Sensitivity, White Level, and cooldown before the bot starts.
+- **Auto-Resolution** — reads screen size automatically via `adb shell wm size`
+- **RAM-Speed Capture** — pipes `screencap` directly into Python (no SD card writes)
+- **Grayscale Sensors** — two invisible ROI boxes count fence pixels instantly
+- **State Machine** — `MENU → PLAYING → RECOVERING` handles every game situation
+- **Ad-Dodge** — force-kills + relaunches the game, skipping 30s ads in ~4 seconds
+- **Pre-Flight Menu** — tune Sensitivity, White Level, and Ad-Skip before starting
 
 ---
 
-## 🛠️ Setup (One Time)
+## 🛠️ Complete Setup (Copy-Paste These One by One)
 
-1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) (NOT Play Store).
+### Step 1 — Install Termux
 
-2. In Termux:
+> ⚠️ Download from **[F-Droid](https://f-droid.org/packages/com.termux/)** only.  
+> The Play Store version is outdated and will give errors.
+
+---
+
+### Step 2 — Install All Tools
+
+Open Termux and paste these commands one at a time:
+
 ```bash
-pkg update -y && pkg upgrade -y
-pkg install python opencv android-tools -y
-pip install numpy
+# 1. Update everything first
+pkg update && pkg upgrade -y
+
+# 2. Install Python, OpenCV build tools, and ADB
+pkg install python ndk-sysroot clang make libjpeg-turbo opencv android-tools git -y
+
+# 3. Install Python packages
+pip install numpy opencv-python
+
+# 4. Grant Termux access to your storage
 termux-setup-storage
 ```
 
-3. Enable **Wireless Debugging** in Settings → Developer Options → Wireless Debugging.
+---
 
-4. Connect ADB:
+### Step 3 — Enable Wireless Debugging (Android 11+)
+
+1. Go to **Settings → About Phone** and tap **Build Number** 7 times to unlock Developer Options.
+2. Go to **Settings → Developer Options → Wireless Debugging** and turn it **ON** (stay connected to WiFi).
+3. Tap **"Pair device with pairing code"** — note the **IP:PairPort** and the **6-digit code**.
+
+---
+
+### Step 4 — Connect ADB in Termux
+
 ```bash
-adb connect <your_ip>:<your_port>    # IP shown on the Wireless Debugging screen
-```
-Allow the popup that appears on your phone.
+# Step A: Pair first (enter the 6-digit code when prompted)
+adb pair <IP>:<PairPort>
 
-5. Clone the bot:
+# Step B: Now connect using the MAIN port shown on the Wireless Debugging screen
+adb connect <IP>:<MainPort>
+```
+
+A popup appears on your phone — tap **Always Allow**.  
+Verify it worked:
+```bash
+adb devices
+# Should show: 192.168.x.x:PORT    device
+```
+
+---
+
+### Step 5 — Get the Bot
+
 ```bash
 cd ~/storage/shared
 git clone https://github.com/Kaddu-Hacker/Bunny-run2.git
@@ -44,34 +82,47 @@ cd Bunny-run2
 
 ---
 
-## 🚀 Running the Bot
+### Step 6 — Run It
 
 ```bash
 python bunny_bot.py
 ```
 
-You will see the settings menu. Use it to tune the values, then press **S** to start. Switch to Bunny Runner — the bot will kick in automatically.
+The Pre-Flight menu appears. Tune your settings, then press **S**.  
+Immediately switch to Bunny Runner — the bot starts in 4 seconds.
 
 To stop: **CTRL+C**
 
 ---
 
-## 🎨 Settings Guide
+## 🎮 Pre-Flight Menu Options
 
-| Setting | Default | What to do if bot is wrong |
+| Option | Default | What it does |
 |---|---|---|
-| **Sensitivity** | 400 | Lower if fences are missed. Raise if bot twitches randomly. |
-| **White Level** | 210 | Lower if fences aren't detected. Raise if road causes false triggers. |
-| **Ad Level** | 240 | Lower if ad-dodge doesn't fire. Raise if it fires during gameplay. |
-| **Tap Cooldown** | 0.15s | Lower for faster reflexes. Raise to reduce tap spam. |
+| **1. Fence Sensitivity** | 500 | Lower = react to thin fences. Raise to ignore false triggers. |
+| **2. White Level** | 220 | Brightness that counts as "fence". Lower if fences are missed. |
+| **3. Ad-Skip Mode** | ON | Auto force-kills + relaunches game to skip unskippable ads. |
+| **4. Tap Cooldown** | 0.15s | Min time between taps. Lower for faster turns. |
 
 ---
 
 ## 🖥️ What You'll See in Termux
 
 ```
-[ L:########  | R:          ] DODGE_RIGHT | State:PLAYING    | Road:True | Tap: 0.1s | 16.4 FPS
+[ L:########  | R:          ] DODGE_RIGHT | PLAYING    | Road:True | Tap: 0.1s | AdSkip:ON | 16.4 FPS
 ```
+
+---
+
+## 🐛 Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `ADB not connected` | Re-run `adb pair` then `adb connect` |
+| Bot not reacting to fences | Lower **Sensitivity** (try 200) or lower **White Level** (try 190) |
+| Bot tap-spamming on road | Raise **Sensitivity** (try 800) or raise **White Level** (try 230) |
+| Ad-Dodge not firing | Lower **Ad Level** in code to 220 |
+| Screen capture too slow | Normal on first run — Termux warms up after ~10 frames |
 
 ---
 
@@ -80,6 +131,7 @@ To stop: **CTRL+C**
 | File | Purpose |
 |---|---|
 | `bunny_bot.py` | The entire bot — one file, self-contained |
+| `requirements.txt` | Python dependencies (`pip install -r requirements.txt`) |
 
 ---
 

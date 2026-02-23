@@ -1,0 +1,4 @@
+# Python packages required to run bunny_bot.py in Termux
+# Install with: pip install -r requirements.txt
+numpy
+opencv-python
