@@ -20,7 +20,8 @@ CONFIG_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "con
 KNOWLEDGE_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_knowledge.json")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MDL = "google/gemini-3.1-pro-preview"
+OPENROUTER_MDL = "google/gemma-3-27b-it:free"
+OPENROUTER_FB_MDL = "openai/gpt-oss-120b:free"
 GOOGLE_URL     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 try:
@@ -95,18 +96,30 @@ def _call_openrouter(api_key: str, prompt: str, frame_b64: str | None = None) ->
     content.append({"type": "text", "text": prompt})
 
     payload = {
-        "model": OPENROUTER_MDL,
         "max_tokens": 60,
         "temperature": 0.2,
         "messages": [{"role": "user", "content": content}],
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    # Try Primary Free Model
     try:
+        payload["model"] = OPENROUTER_MDL
         r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=10)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print(f"⚠️  OpenRouter: {e}")
+        print(f"⚠️  OpenRouter Primary ({OPENROUTER_MDL}) failed: {e}")
+        
+    # Try Fallback Free Model
+    try:
+        print(f"🔄 Trying OpenRouter Fallback ({OPENROUTER_FB_MDL})...")
+        payload["model"] = OPENROUTER_FB_MDL
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=10)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"⚠️  OpenRouter Fallback ({OPENROUTER_FB_MDL}) failed: {e}")
         return None
 
 def _call_google(api_key: str, prompt: str, frame_b64: str | None = None) -> str | None:
