@@ -1,628 +1,859 @@
-import subprocess
-import time
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════╗
+║         🐰  BunnyBot — Bunny Runner 3D  (Pure OpenCV)       ║
+║         100% local  •  No AI  •  No internet required       ║
+╚══════════════════════════════════════════════════════════════╝
+
+HOW THE GAME WORKS:
+  • The bunny runs on a winding 3D path that curves LEFT / RIGHT
+  • Swipe left or right to steer
+  • Collect carrots, avoid fences
+  • Speed increases each level
+
+HOW THIS BOT WORKS:
+  Every ~100 ms the bot:
+    1. Captures the screen via ADB
+    2. Detects which way the path curves  (left/right pixel balance)
+    3. Detects fences in danger zones     (template + colour)
+    4. Detects game-over screen           (dark overlay heuristic)
+    5. Sends the right ADB swipe command
+
+  Zero API calls.  Zero internet.  Pure local OpenCV vision.
+
+TEMPLATE FILES (put in the same folder as this script):
+  template_carrot.png   — reference image of a carrot
+  template_fence.png    — reference image of a fence
+  template_rabbit.png   — reference image of the bunny
+
+SETUP (Termux — run once):
+  pkg update && pkg upgrade -y
+  pkg install python android-tools python-numpy opencv-python git -y
+  python bunny_bot.py
+"""
+
 import os
 import sys
-import base64
-import json
-import io
-import random
-from datetime import datetime
-import requests
-import io
-import threading
-import struct
-import socket
-import asyncio
+import time
+import subprocess
+import traceback
 
+# Hard dependency — exit immediately with a helpful message if missing
 try:
-    from putergenai import PuterClient
-    PUTER_AVAILABLE = True
+    import cv2
+    import numpy as np
 except ImportError:
-    PUTER_AVAILABLE = False
-    
-try:
-    import av # type: ignore
-    PYAV_AVAILABLE = True
-except ImportError:
-    PYAV_AVAILABLE = False
+    print("\n[FATAL] OpenCV / NumPy not found.")
+    print("  Fix (Termux): pkg install python-numpy opencv-python -y")
+    print("  Fix (Linux):  pip install opencv-python numpy")
+    sys.exit(1)
 
-try:
-    import adbutils
-    ADB_AVAILABLE = True
-except ImportError:
-    ADB_AVAILABLE = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  BunnyBot — Self-Learning AI Edition 🧠
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ★  CONFIGURATION  — all tuneable values in one place
+# ═══════════════════════════════════════════════════════════════════════════════
 
-PACKAGE_NAME     = "com.bunny.runner3D.dg"
-AI_CALL_INTERVAL = 1.5
-LOOP_INTERVAL    = 0.08
-CONFIG_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-KNOWLEDGE_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_knowledge.json")
+CFG = {
 
-PUTER_MODEL      = "gemini-3.1-pro-preview"
+    # ── ADB ──────────────────────────────────────────────────────────────────
+    # Leave empty → bot auto-detects the first connected device.
+    # Set to "192.168.x.x:PORT" to target a specific phone over Wi-Fi.
+    "device": "",
+    "adb_timeout": 8,             # seconds before killing a hung adb call
 
-try:
-    import cv2, numpy as np
-    VISION_AVAILABLE = True
-except ImportError:
-    VISION_AVAILABLE = False
+    # ── Game package ─────────────────────────────────────────────────────────
+    # Run:  adb shell pm list packages | grep bunny
+    # to verify this on your device.
+    "game_package": "com.kwalee.bunnyrunner",
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+    # ── Template files (same folder as bunny_bot.py) ──────────────────────────
+    "tmpl_carrot": "template_carrot.png",
+    "tmpl_fence":  "template_fence.png",
+    "tmpl_rabbit": "template_rabbit.png",
 
-def load_config() -> dict:
-    default = {
-        "openrouter_key": "",
-        "google_key":     "",
-        "active_ai":      "OPENROUTER", # "OPENROUTER" or "GOOGLE"
-        "device_id":      "",
-        "use_ai":         True,
-        "tap_cooldown":   0.12,
-    }
-    if os.path.exists(CONFIG_FILE):
-        try:
-            saved = json.load(open(CONFIG_FILE, encoding="utf-8"))
-            default.update(saved)
-        except Exception:
-            pass
-    return default
+    # Match confidence threshold (0.0 loose → 1.0 strict).
+    # Lower if templates aren't found; raise to stop false positives.
+    "tmpl_threshold": 0.60,
 
-def save_config(cfg: dict):
-    try:
-        json.dump(cfg, open(CONFIG_FILE, "w", encoding="utf-8"), indent=2)
-    except Exception:
-        pass
+    # ── Timing ───────────────────────────────────────────────────────────────
+    "loop_fps":        10,    # main loop frames-per-second
+    "startup_delay":    5,    # countdown seconds before bot goes live
+    "swipe_ms":        80,    # ADB swipe gesture duration (ms)
+    "swipe_px":       300,    # horizontal pixel distance per swipe
+    "action_cooldown": 0.20,  # minimum seconds between consecutive swipes
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  KNOWLEDGE BASE
-# ─────────────────────────────────────────────────────────────────────────────
+    # ── Screen zones  (all values are fractions 0.0–1.0) ─────────────────────
 
-DEFAULT_KNOWLEDGE = {
-    "game_summary":     "",
-    "rules":            [],
-    "state_hints":      {},
-    "session_count":    0,
-    "new_observations": [],
-    "last_updated":     "",
+    # LOOK-AHEAD STRIP  — the horizontal band where we measure path direction.
+    # The bot compares path-coloured pixels on the left half vs right half
+    # of this strip to determine which way the track is curving.
+    "la_top":    0.30,   # top    edge of the strip
+    "la_bottom": 0.55,   # bottom edge of the strip
+
+    # DANGER ZONES — rectangles where we watch for incoming fences.
+    "dz_left_x":  (0.05, 0.42),   # x range: left  danger zone
+    "dz_right_x": (0.58, 0.95),   # x range: right danger zone
+    "dz_y":       (0.28, 0.68),   # y range: shared for both zones
+
+    # GAME-OVER ZONE — where retry/score UI appears after death
+    "gameover_y": (0.58, 0.95),
+    "gameover_x": (0.20, 0.80),
+
+    # ── Path colour  (HSV) ────────────────────────────────────────────────────
+    # The colour of the running track / ground surface.
+    # Use Calibration (menu → C) to auto-detect the right values for your game.
+    "path_hsv_lo": [8,  15, 130],
+    "path_hsv_hi": [38, 110, 255],
+
+    # Minimum fraction of lookahead strip that must be path-coloured before we
+    # trust the direction signal (prevents acting on black/menu screens).
+    "path_min_fill": 0.04,
+
+    # Imbalance needed before we steer.
+    # 0.12 → one side needs 12 percentage-points more path pixels than the other.
+    # Raise (e.g. 0.18) to reduce jitter; lower (e.g. 0.08) for sharper curves.
+    "path_deadband": 0.12,
+
+    # ── Fence / obstacle colour  (HSV) ───────────────────────────────────────
+    # Fences are typically bright white or very light grey.
+    "fence_hsv_lo": [0,   0, 185],
+    "fence_hsv_hi": [180, 45, 255],
+
+    # Pixel count in a danger zone that triggers an emergency dodge.
+    # Lower = more sensitive; higher = fewer false positives.
+    "fence_px_threshold": 280,
+
+    # ── Game-over detection ───────────────────────────────────────────────────
+    # Triggered when BOTH conditions are true:
+    #   1. >55% of the screen is very dark (the dim overlay)
+    #   2. >400 bright pixels in the bottom zone (score / retry button)
+    "gameover_dark_frac":   0.55,
+    "gameover_dark_v_max":  60,
+    "gameover_bright_px":   400,
+
+    # ── Debug ─────────────────────────────────────────────────────────────────
+    "debug": False,
+    "debug_save_frames": False,   # saves annotated JPEGs to ./debug_frames/
 }
 
-def load_knowledge() -> dict:
-    if os.path.exists(KNOWLEDGE_FILE):
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ADB WRAPPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ADB:
+    def __init__(self, device: str = ""):
+        self.device = device
+        self._build_prefix()
+
+    def _build_prefix(self):
+        self._pfx = ["adb", "-s", self.device] if self.device else ["adb"]
+
+    def _run(self, args: list, timeout: int = None):
+        cmd = self._pfx + args
+        t   = timeout or CFG["adb_timeout"]
         try:
-            return json.load(open(KNOWLEDGE_FILE, encoding="utf-8"))
-        except Exception:
-            pass
-    return dict(DEFAULT_KNOWLEDGE)
+            r = subprocess.run(cmd, capture_output=True, timeout=t)
+            return r.returncode, r.stdout
+        except subprocess.TimeoutExpired:
+            return -1, b""
+        except FileNotFoundError:
+            print("[FATAL] 'adb' not found.")
+            print("  Fix: pkg install android-tools -y")
+            sys.exit(1)
 
-def save_knowledge(kb: dict):
-    kb["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    try:
-        json.dump(kb, open(KNOWLEDGE_FILE, "w", encoding="utf-8"), indent=2)
-    except Exception:
-        pass
+    # ── Device management ────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  AI CALLERS
-# ─────────────────────────────────────────────────────────────────────────────
+    def list_devices(self):
+        _, out = self._run(["devices"])
+        lines  = out.decode(errors="ignore").strip().splitlines()
+        return [ln.split("\t")[0] for ln in lines[1:] if "\tdevice" in ln]
 
-def call_ai(cfg: dict, prompt: str, frame_bytes: bytes | None = None) -> str | None:
-    if not PUTER_AVAILABLE:
-        print("⚠️  putergenai is not installed. AI is disabled.")
+    def auto_connect(self) -> bool:
+        devs = self.list_devices()
+        if not devs:
+            return False
+        self.device = devs[0]
+        self._build_prefix()
+        print(f"[ADB] Auto-selected: {self.device}")
+        return True
+
+    def is_connected(self) -> bool:
+        return bool(self.list_devices())
+
+    # ── Screen capture ───────────────────────────────────────────────────────
+
+    def screencap(self):
+        """
+        Capture current screen → BGR NumPy array.
+        Tries three increasingly compatible methods.
+        """
+        # Method 1: exec-out (fastest — no temp file)
+        rc, data = self._run(["exec-out", "screencap", "-p"], timeout=10)
+        if rc == 0 and len(data) > 2000:
+            img = _png_bytes_to_bgr(data)
+            if img is not None:
+                return img
+
+        # Method 2: screencap to /sdcard then pull
+        self._run(["shell", "screencap", "-p", "/sdcard/_bbot.png"])
+        rc, _ = self._run(["pull", "/sdcard/_bbot.png", "/tmp/_bbot.png"])
+        if rc == 0:
+            img = cv2.imread("/tmp/_bbot.png")
+            if img is not None:
+                return img
+
+        # Method 3: screencap to /data/local/tmp (no storage permission needed)
+        self._run(["shell", "screencap", "-p", "/data/local/tmp/_bbot.png"])
+        rc, _ = self._run(["pull", "/data/local/tmp/_bbot.png", "/tmp/_bbot2.png"])
+        if rc == 0:
+            img = cv2.imread("/tmp/_bbot2.png")
+            if img is not None:
+                return img
+
         return None
-        
-    b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else None
 
-    async def _do_call() -> str | None:
-        try:
-            client = PuterClient()
-            img_url = f"data:image/png;base64,{b64}" if b64 else None
-            
-            res = await client.ai_chat(
-                prompt=prompt,
-                image_url=img_url,
-                options={"model": PUTER_MODEL}
+    # ── Input ────────────────────────────────────────────────────────────────
+
+    def tap(self, x: int, y: int):
+        self._run(["shell", "input", "tap", str(x), str(y)])
+
+    def swipe(self, x1, y1, x2, y2, ms: int):
+        self._run(["shell", "input", "swipe",
+                   str(x1), str(y1), str(x2), str(y2), str(ms)])
+
+    def swipe_left(self, w: int, h: int):
+        cx = w // 2
+        cy = int(h * 0.60)
+        d  = CFG["swipe_px"] // 2
+        self.swipe(cx + d, cy, cx - d, cy, CFG["swipe_ms"])
+
+    def swipe_right(self, w: int, h: int):
+        cx = w // 2
+        cy = int(h * 0.60)
+        d  = CFG["swipe_px"] // 2
+        self.swipe(cx - d, cy, cx + d, cy, CFG["swipe_ms"])
+
+    # ── Game lifecycle ───────────────────────────────────────────────────────
+
+    def launch_game(self):
+        pkg = CFG["game_package"]
+        self._run(["shell", "monkey", "-p", pkg,
+                   "-c", "android.intent.category.LAUNCHER", "1"])
+
+    def force_stop(self):
+        self._run(["shell", "am", "force-stop", CFG["game_package"]])
+
+    def restart_game(self, reason: str = ""):
+        label = f" ({reason})" if reason else ""
+        print(f"[BOT] Restarting game{label}…")
+        self.force_stop()
+        time.sleep(1.5)
+        self.launch_game()
+        time.sleep(3.5)
+
+
+def _png_bytes_to_bgr(data: bytes):
+    """Decode raw PNG bytes (possibly with CRLF from ADB) to BGR array."""
+    data = data.replace(b"\r\n", b"\n")
+    buf  = np.frombuffer(data, dtype=np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TEMPLATE BANK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TemplateBank:
+    """
+    Loads carrot / fence / rabbit reference images and builds a scale pyramid
+    so matching works reliably across different phone screen resolutions.
+    """
+
+    # Scales to test during matching (covers most phone resolutions)
+    SCALES = (0.35, 0.50, 0.70, 0.90, 1.00, 1.20, 1.50)
+
+    def __init__(self):
+        self._bank: dict = {}
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        specs = [
+            ("carrot", CFG["tmpl_carrot"]),
+            ("fence",  CFG["tmpl_fence"]),
+            ("rabbit", CFG["tmpl_rabbit"]),
+        ]
+
+        for key, fname in specs:
+            fpath = os.path.join(script_dir, fname)
+            img   = cv2.imread(fpath, cv2.IMREAD_COLOR)
+            if img is None:
+                print(f"[TMPL] ⚠  Not found: {fpath}  — {key} matching disabled")
+                continue
+            h, w = img.shape[:2]
+            pyramid = []
+            for s in self.SCALES:
+                nw = max(4, int(w * s))
+                nh = max(4, int(h * s))
+                pyramid.append(cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA))
+            self._bank[key] = pyramid
+            print(f"[TMPL] ✓  {fname}  ({w}×{h}px, {len(self.SCALES)} scales)")
+
+    def find(self, frame, key: str, roi=None):
+        """
+        Search for template <key> inside <frame>.
+        roi = (x1, y1, x2, y2) in pixels to restrict search area.
+        Returns (found: bool, confidence: float, centre: (cx, cy))
+        """
+        if key not in self._bank or frame is None:
+            return False, 0.0, (0, 0)
+
+        search = frame
+        ox, oy = 0, 0
+        if roi:
+            x1, y1, x2, y2 = roi
+            search = frame[y1:y2, x1:x2]
+            ox, oy = x1, y1
+
+        sh, sw    = search.shape[:2]
+        best_val  = 0.0
+        best_loc  = (0, 0)
+        best_size = (1, 1)
+
+        for tmpl in self._bank[key]:
+            th, tw = tmpl.shape[:2]
+            if tw > sw or th > sh:
+                continue
+            try:
+                res  = cv2.matchTemplate(search, tmpl, cv2.TM_CCOEFF_NORMED)
+                _, v, _, loc = cv2.minMaxLoc(res)
+                if v > best_val:
+                    best_val, best_loc, best_size = v, loc, (tw, th)
+            except cv2.error:
+                continue
+
+        found = best_val >= CFG["tmpl_threshold"]
+        cx    = ox + best_loc[0] + best_size[0] // 2
+        cy    = oy + best_loc[1] + best_size[1] // 2
+        return found, round(best_val, 3), (cx, cy)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VISION ENGINE  — converts a frame into a game action
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Vision:
+    """
+    Decision priority (first match wins):
+      1. Game-over overlay detected  →  RESTART
+      2. Fence in left danger zone   →  RIGHT   (dodge away from it)
+      3. Fence in right danger zone  →  LEFT    (dodge away from it)
+      4. Path curves right           →  RIGHT
+      5. Path curves left            →  LEFT
+      6. Everything else             →  STRAIGHT
+    """
+
+    def __init__(self, bank: TemplateBank):
+        self.bank = bank
+
+    # ── Main entry ───────────────────────────────────────────────────────────
+
+    def decide(self, frame):
+        """Returns (action_str, debug_dict)."""
+        h, w  = frame.shape[:2]
+        dbg   = {"w": w, "h": h}
+
+        # Priority 1 — game-over?
+        if self._game_over(frame, w, h):
+            dbg["reason"] = "GAME_OVER"
+            return "RESTART", dbg
+
+        # Priority 2 & 3 — fence / obstacle
+        fence_action, fdebug = self._check_fences(frame, w, h)
+        dbg.update(fdebug)
+        if fence_action:
+            dbg["reason"] = f"FENCE → {fence_action}"
+            return fence_action, dbg
+
+        # Priority 4 & 5 — path direction
+        path_action, pdebug = self._check_path(frame, w, h)
+        dbg.update(pdebug)
+        dbg["reason"] = f"PATH → {path_action}"
+        return path_action, dbg
+
+    # ── Game-over detection ──────────────────────────────────────────────────
+
+    def _game_over(self, frame, w: int, h: int) -> bool:
+        """
+        Two-signal heuristic:
+          A) Most of the screen is very dark (dim overlay after death)
+          B) Bright UI elements visible in the bottom-centre zone (retry button)
+        Both must be true to avoid false positives.
+        """
+        hsv      = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        v_chan   = hsv[:, :, 2]
+
+        # Signal A: dark overlay coverage
+        dark_px  = int(np.count_nonzero(v_chan < CFG["gameover_dark_v_max"]))
+        dark_frac = dark_px / max(v_chan.size, 1)
+        if dark_frac < CFG["gameover_dark_frac"]:
+            return False
+
+        # Signal B: bright retry/score button in lower zone
+        gy1 = int(CFG["gameover_y"][0] * h)
+        gy2 = int(CFG["gameover_y"][1] * h)
+        gx1 = int(CFG["gameover_x"][0] * w)
+        gx2 = int(CFG["gameover_x"][1] * w)
+        zone_v    = v_chan[gy1:gy2, gx1:gx2]
+        bright_px = int(np.count_nonzero(zone_v > 200))
+
+        return bright_px > CFG["gameover_bright_px"]
+
+    # ── Fence detection ──────────────────────────────────────────────────────
+
+    def _check_fences(self, frame, w: int, h: int):
+        lo  = np.array(CFG["fence_hsv_lo"], dtype=np.uint8)
+        hi  = np.array(CFG["fence_hsv_hi"], dtype=np.uint8)
+        thr = CFG["fence_px_threshold"]
+
+        lx1 = int(CFG["dz_left_x"][0]  * w);  lx2 = int(CFG["dz_left_x"][1]  * w)
+        rx1 = int(CFG["dz_right_x"][0] * w);  rx2 = int(CFG["dz_right_x"][1] * w)
+        zy1 = int(CFG["dz_y"][0] * h);         zy2 = int(CFG["dz_y"][1] * h)
+
+        hsv        = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        left_mask  = cv2.inRange(hsv[zy1:zy2, lx1:lx2], lo, hi)
+        right_mask = cv2.inRange(hsv[zy1:zy2, rx1:rx2], lo, hi)
+        lc         = int(np.count_nonzero(left_mask))
+        rc         = int(np.count_nonzero(right_mask))
+        dbg        = {"fence_L": lc, "fence_R": rc}
+
+        # Template match as a second signal (boosts confidence)
+        lroi = (lx1, zy1, lx2, zy2)
+        rroi = (rx1, zy1, rx2, zy2)
+        t_left,  cl, _ = self.bank.find(frame, "fence", roi=lroi)
+        t_right, cr, _ = self.bank.find(frame, "fence", roi=rroi)
+        dbg["fence_tmpl_L"] = cl
+        dbg["fence_tmpl_R"] = cr
+
+        left_blocked  = (lc > thr) or t_left
+        right_blocked = (rc > thr) or t_right
+
+        if left_blocked and right_blocked:
+            return ("RIGHT" if lc >= rc else "LEFT"), dbg
+        if left_blocked:
+            return "RIGHT", dbg
+        if right_blocked:
+            return "LEFT", dbg
+        return None, dbg
+
+    # ── Path direction detection ─────────────────────────────────────────────
+
+    def _check_path(self, frame, w: int, h: int):
+        """
+        Isolate path-coloured pixels inside the look-ahead strip.
+        Compare pixel count: left half vs right half.
+        More pixels on the right → path curves right → swipe RIGHT.
+        """
+        y1    = int(CFG["la_top"]    * h)
+        y2    = int(CFG["la_bottom"] * h)
+        strip = frame[y1:y2, :]
+
+        lo  = np.array(CFG["path_hsv_lo"], dtype=np.uint8)
+        hi  = np.array(CFG["path_hsv_hi"], dtype=np.uint8)
+        hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, lo, hi)
+
+        total       = mask.size
+        total_path  = int(np.count_nonzero(mask))
+        dbg         = {"path_fill": round(total_path / max(total, 1), 3)}
+
+        # Not enough path visible — likely a menu or black loading screen
+        if total_path < CFG["path_min_fill"] * total:
+            return "STRAIGHT", dbg
+
+        mid   = w // 2
+        left  = int(np.count_nonzero(mask[:, :mid]))
+        right = int(np.count_nonzero(mask[:, mid:]))
+        dbg["path_L"] = left
+        dbg["path_R"] = right
+
+        denom = left + right
+        if denom == 0:
+            return "STRAIGHT", dbg
+
+        db = CFG["path_deadband"]
+        r_frac = right / denom
+
+        if r_frac > 0.5 + db:
+            return "RIGHT", dbg
+        elif r_frac < 0.5 - db:
+            return "LEFT", dbg
+        else:
+            return "STRAIGHT", dbg
+
+    # ── Calibration helper ───────────────────────────────────────────────────
+
+    def calibrate(self, frame):
+        """
+        Sample path colour from the lower-centre of a live in-game screenshot
+        and print recommended HSV range values.
+        """
+        h, w  = frame.shape[:2]
+        # Sample patch just below the bunny / directly on the path
+        patch = frame[int(h * 0.72): int(h * 0.84),
+                      int(w * 0.38): int(w * 0.62)]
+        hsv   = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(float)
+        med   = np.median(hsv, axis=0)
+        lo    = np.clip(med - [15, 35, 50], 0, 255).astype(int).tolist()
+        hi    = np.clip(med + [15, 50, 40], 0, 255).astype(int).tolist()
+
+        print("\n─────────── PATH COLOUR CALIBRATION ────────────")
+        print(f"  Median HSV:  H={med[0]:.1f}  S={med[1]:.1f}  V={med[2]:.1f}")
+        print(f"  path_hsv_lo = {lo}")
+        print(f"  path_hsv_hi = {hi}")
+        print("  Paste these into CFG at the top of bunny_bot.py")
+        print("────────────────────────────────────────────────\n")
+        return lo, hi
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOT RUNNER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BunnyBot:
+
+    def __init__(self):
+        self.adb    = ADB(CFG["device"])
+        self.bank   = TemplateBank()
+        self.vision = Vision(self.bank)
+        self._reset_state()
+
+    def _reset_state(self):
+        self.frame_count       = 0
+        self.start_time        = 0.0
+        self.last_action       = "STRAIGHT"
+        self.last_act_time     = 0.0
+        self.consecutive_fails = 0
+        self.screen_w          = 0
+        self.screen_h          = 0
+
+    # ── Setup ────────────────────────────────────────────────────────────────
+
+    def setup(self) -> bool:
+        print("\n[BOT] Checking ADB connection…")
+
+        if not CFG["device"]:
+            if not self.adb.auto_connect():
+                print(
+                    "[ERROR] No device found.\n"
+                    "  Steps:\n"
+                    "    1. Enable Developer Options on your phone\n"
+                    "    2. Turn on Wireless Debugging\n"
+                    "    3. adb pair <IP>:<PAIR_PORT>\n"
+                    "    4. adb connect <IP>:<CONN_PORT>"
+                )
+                return False
+        else:
+            if not self.adb.is_connected():
+                print(f"[ERROR] Device '{CFG['device']}' not reachable.")
+                return False
+
+        print("[BOT] Testing screen capture…")
+        frame = self.adb.screencap()
+        if frame is None:
+            print(
+                "[ERROR] Screen capture failed.\n"
+                "  Try: adb kill-server && adb connect <IP>:<PORT>"
             )
-            return res.get("message", {}).get("content", "").strip()
-        except Exception as e:
-            print(f"⚠️  PuterGenAI Bridge failed: {e}")
-            return None
-            
-    # Bridge sync to async
-    try:
-        return asyncio.run(_do_call())
-    except Exception as e:
-        print(f"⚠️  Event loop error: {e}")
-        return None
+            return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  LEARNING SYSTEM
-# ─────────────────────────────────────────────────────────────────────────────
+        h, w = frame.shape[:2]
+        self.screen_w = w
+        self.screen_h = h
+        print(f"[BOT] Screen: {w}×{h}px  ✓")
+        print("[BOT] Ready!\n")
+        return True
 
-def phase1_learn_game(cfg: dict, frame_bytes: bytes | None, kb: dict):
-    if frame_bytes is None: return
-    print("\n🎓 First run — AI is learning the game from the screen...")
-    prompt = (
-        "You are analyzing a mobile game called 'Bunny Runner 3D'.\n"
-        "From this screenshot, provide:\n"
-        "SUMMARY: <one sentence describing the game>\n"
-        "RULES:\n"
-        "- <rule 1: what to do and when>\n"
-        "- <rule 2>\n"
-        "... (5 to 10 rules covering gameplay, menus, ads, death screen)\n\n"
-        "Focus on what a bot needs to know to play. Output the EXACT format requested."
-    )
-    result = call_ai(cfg, prompt, frame_bytes)
-    if not result:
-        print("⚠️  Could not learn game — will retry next run.")
-        return
+    # ── Main loop ────────────────────────────────────────────────────────────
 
-    summary, rules = "", []
-    lines = result.splitlines()
-    for line in lines:
-        line = line.strip()
-        if line.startswith("SUMMARY:"):
-            summary = line[8:].strip()
-        elif line.startswith("- "):
-            rules.append(line[2:].strip())
-
-    if summary: kb["game_summary"] = summary
-    if rules:   kb["rules"] = rules
-    save_knowledge(kb)
-    if summary or rules:
-        print(f"✅ Game learned! {len(rules)} rules saved.")
-
-def phase3_consolidate(cfg: dict, kb: dict):
-    obs = kb.get("new_observations", [])
-    if not obs: return
-    print(f"\n🧠 Consolidating {len(obs)} observations into knowledge base...")
-    existing  = "\n".join(f"- {r}" for r in kb.get("rules", []))
-    obs_text  = "\n".join(f"- {o}" for o in obs[-20:])
-    prompt = (
-        f"Game bot knowledge base for 'Bunny Runner 3D'.\n\n"
-        f"Existing rules:\n{existing or '(none)'}\n\n"
-        f"New session observations:\n{obs_text}\n\n"
-        f"List any NEW rules not already covered. "
-        f"Format: one rule per line starting with '- '. "
-        f"If nothing new, output exactly: NONE"
-    )
-    result = call_ai(cfg, prompt)
-    if result and result.strip().upper() != "NONE":
-        lines = result.splitlines()
-        new_rules = [l[2:].strip() for l in lines if l.strip().startswith("- ")]
-        if new_rules:
-            kb["rules"].extend(new_rules)
-            print(f"✅ Added {len(new_rules)} new rules to knowledge base!")
-    kb["new_observations"] = []
-    kb["session_count"]    = kb.get("session_count", 0) + 1
-    save_knowledge(kb)
-
-def build_game_prompt(game_state: str, recent_moves: list, kb: dict) -> str:
-    rules   = "\n".join(f"  - {r}" for r in kb.get("rules", [])) or "  (still learning)"
-    summary = kb.get("game_summary", "Bunny Runner 3D is an endless runner.")
-    recent  = ", ".join(recent_moves[-4:]) if recent_moves else "none"
-    hint    = kb.get("state_hints", {}).get(game_state, "")
-    return (
-        f"You are a bot playing: {summary}\n\n"
-        f"Learned rules:\n{rules}\n\n"
-        f"Current game state: {game_state}\n"
-        f"{('Hint: ' + hint) if hint else ''}\n"
-        f"Last 4 moves: {recent}\n\n"
-        f"Look VERY CAREFULLY at this screenshot. Your job is to OUTPUT A COMMAND.\n"
-        f"If you see a menu, play button, or retry/revive button, you MUST output 'TAP [x] [y]'.\n"
-        f"If you see gameplay (the bunny running), look for obstacles. If there is a barrier, output 'MOVE LEFT', 'MOVE RIGHT' or 'JUMP'.\n"
-        f"DO NOT OUTPUT 'NONE' unless you are 100% sure the bunny is currently running on a completely empty path with no menus on screen.\n\n"
-        f"Choose the SINGLE BEST ACTION. Output EXACTLY ONE LINE from these choices:\n"
-        f"  MOVE LEFT\n  MOVE RIGHT\n  JUMP\n  NONE\n  TAP [x] [y]\n\n"
-        f"Do not include any explanation. Just the command."
-    )
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN MENU
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main_menu(cfg: dict, kb: dict) -> dict:
-    while True:
-        os.system("clear")
-        def ks(k): return "SET ✅" if k else "NOT SET ❌"
-        sessions = kb.get("session_count", 0)
-        rules    = len(kb.get("rules", []))
-        
-        active_ai_str = "OpenRouter" if cfg.get("active_ai") == "OPENROUTER" else "Google AI Studio"
-
-        print("╔══════════════════════════════════════════════════════╗")
-        print("║   🐰  BUNNY RUNNER 3D — SELF-LEARNING AI BOT        ║")
-        print("╠══════════════════════════════════════════════════════╣")
-        print(f"║  📡 OpenRouter Key : {ks(cfg.get('openrouter_key')):<33}║")
-        print(f"║  🔑 Google AI Key  : {ks(cfg.get('google_key')):<33}║")
-        print(f"║  ⭐ Active AI      : {active_ai_str:<33}║")
-        print(f"║  🧠 Knowledge      : {(str(rules)+' rules, '+str(sessions)+' sessions'):<33}║")
-        print(f"║  👁  Vision Reflex : {'OpenCV ✅' if VISION_AVAILABLE else 'pkg not installed ⚠️':<33}║")
-        print(f"║  🤖 AI Mode        : {'ON ✅' if cfg['use_ai'] else 'OFF ❌':<33}║")
-        print("╠══════════════════════════════════════════════════════╣")
-        print("║  1. Set OpenRouter API Key                          ║")
-        print("║  2. Set Google AI Studio Key                        ║")
-        print("║  3. Select Active AI Method (Toggle)                ║")
-        print("║  4. Set Target Device (IP:PORT or blank=local)      ║")
-        print("║  5. Toggle AI Mode                                  ║")
-        print("║  6. Clear Knowledge Base (reset learning)           ║")
-        print("╠══════════════════════════════════════════════════════╣")
-        print("║  S. START BOT          Q. QUIT                      ║")
-        print("╚══════════════════════════════════════════════════════╝")
-
-        choice = input("\nSelect Option: ").strip().upper()
-        if choice == "1":
-            k = input("  Paste OpenRouter key (Enter to clear): ").strip()
-            cfg["openrouter_key"] = k; save_config(cfg)
-            print("  ✅ Saved." if k else "  ✅ Cleared."); time.sleep(1)
-        elif choice == "2":
-            k = input("  Paste Google AI Studio key (Enter to clear): ").strip()
-            cfg["google_key"] = k; save_config(cfg)
-            print("  ✅ Saved." if k else "  ✅ Cleared."); time.sleep(1)
-        elif choice == "3":
-            if cfg.get("active_ai") == "OPENROUTER":
-                cfg["active_ai"] = "GOOGLE"
-            else:
-                cfg["active_ai"] = "OPENROUTER"
-            save_config(cfg)
-            print(f"  ✅ Active AI changed to {cfg['active_ai']}."); time.sleep(1)
-        elif choice == "4":
-            cfg["device_id"] = input("  Device IP:PORT (blank=local): ").strip()
-            save_config(cfg)
-        elif choice == "5":
-            cfg["use_ai"] = not cfg["use_ai"]; save_config(cfg)
-        elif choice == "6":
-            if input("  Reset all knowledge? (yes/no): ").strip().lower() == "yes":
-                kb.update(DEFAULT_KNOWLEDGE); save_knowledge(kb)
-                print("  ✅ Knowledge base cleared."); time.sleep(1)
-        elif choice == "S":
-            return cfg
-        elif choice == "Q":
-            sys.exit(0)
-    return cfg  # Unreachable but satisfies linter
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  BOT CLASS
-# ─────────────────────────────────────────────────────────────────────────────
-
-class BunnyBotAI:
-    def __init__(self, config: dict, kb: dict):
-        self.w, self.h    = 0, 0
-        self.config       = config
-        self.kb           = kb
-        self.game_state   = "UNKNOWN"
-        self.recent_moves: list[str] = []
-        self._last_ai_ts  = 0.0
-        self._fail_streak = 0
-        self.ai_available = bool(config.get("openrouter_key") or config.get("google_key"))
-        self._ai_active   = False
-        
-        # Init ADB connection (fast socket access)
-        self.adb_device = None
-        if ADB_AVAILABLE:
-            try:
-                adbc = adbutils.AdbClient(host="127.0.0.1", port=5037)
-                if self.config.get("device_id"):
-                    self.adb_device = adbc.device(serial=self.config["device_id"])
-                else:
-                    self.adb_device = adbc.device()
-                if self.adb_device:
-                    print(f"✅ ADB connected via adbutils to: {self.adb_device.serial}")
-            except Exception as e:
-                print(f"⚠️  adbutils connection failed: {e}")
-
-        self._get_resolution()
-        
-        # Init Scrcpy Stream Buffer
-        self.latest_frame_bytes = None
-        self._streaming = False
-        if PYAV_AVAILABLE and self.adb_device:
-            self.start_scrcpy_stream()
-            
-        # Try loading template images for OpenCV
-        self.templates = {}
-        for t_name in ["fence", "carrot", "rabbit"]:
-            t_path = os.path.join(os.path.dirname(__file__), f"template_{t_name}.png")
-            if os.path.exists(t_path):
-                self.templates[t_name] = cv2.imread(t_path, cv2.IMREAD_GRAYSCALE)
-                
-        self.left_roi  = (int(self.h*0.65), int(self.h*0.75), int(self.w*0.10), int(self.w*0.45))
-        self.right_roi = (int(self.h*0.65), int(self.h*0.75), int(self.w*0.55), int(self.w*0.90))
-
-    def start_scrcpy_stream(self):
-        print("🚀 Booting PyAV Scrcpy Stream...")
-        try:
-            # Push server
-            server_path = os.path.join(os.path.dirname(__file__), "scrcpy-server.jar")
-            if os.path.exists(server_path):
-                self.adb_device.sync.push(server_path, "/data/local/tmp/scrcpy-server.jar")
-                # Forward port
-                self.adb_device.forward("tcp:8081", "localabstract:scrcpy")
-                
-                # Start server in background
-                def run_server():
-                    cmd = "CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server 2.4 tunnel_forward=true control=false cleanup=false"
-                    self.adb_device.shell(cmd)
-                threading.Thread(target=run_server, daemon=True).start()
-                time.sleep(1) # wait for server bindings
-
-                self._streaming = True
-                threading.Thread(target=self._scrcpy_receiver_loop, daemon=True).start()
-                print("✅ PyAV Scrcpy Stream Thread Started.")
-            else:
-                print("⚠️ scrcpy-server.jar not found, falling back to adbutils screenshots.")
-        except Exception as e:
-            print(f"⚠️ Scrcpy stream init failed: {e}")
-            
-    def _scrcpy_receiver_loop(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.connect(("127.0.0.1", 8081))
-            _ = s.recv(68) # Dummy read for device name
-            
-            codec = av.CodecContext.create('h264', 'r')
-            while self._streaming:
-                time.sleep(0.01) # Optimize Termux CPU usage
-                # Scrcpy protocol video header: pts (8 bytes) + packet size (4 bytes)
-                header = s.recv(12)
-                if len(header) < 12: break
-                _, pkt_size = struct.unpack(">QI", header)
-                
-                pkt_data = bytearray()
-                while len(pkt_data) < pkt_size:
-                    chunk = s.recv(pkt_size - len(pkt_data))
-                    if not chunk: break
-                    pkt_data.extend(chunk)
-                    
-                packet = av.Packet(bytes(pkt_data))
-                frames = codec.decode(packet)
-                for frame in frames:
-                    # Convert raw NV12 to BGR numpy array
-                    img = frame.to_ndarray(format='bgr24')
-                    # Encode to PNG bytes so pixel_reflex interface stays consistent
-                    success, enc = cv2.imencode('.png', img)
-                    if success:
-                        self.latest_frame_bytes = enc.tobytes()
-        except Exception as e:
-            print(f"Scrcpy Stream Error: {e}")
-        finally:
-            s.close()
-            self._streaming = False
-
-    def _adb(self, cmd):
-        dev = f"-s {self.config['device_id']} " if self.config.get('device_id') else ""
-        return f"adb {dev}{cmd}"
-        
-    def _run(self, cmd): return subprocess.check_output(cmd, shell=True)
-
-    def _get_resolution(self):
-        try:
-            if getattr(self, 'adb_device', None) and hasattr(self.adb_device, 'window_size'):
-                info = self.adb_device.window_size()
-                self.w, self.h = info.width, info.height
-            else:
-                raw = self._run(self._adb("shell wm size")).decode()
-                self.w, self.h = map(int, raw.split(":")[-1].strip().split("x"))
-        except Exception:
-            self.w, self.h = 1080, 2400
-    
-    def get_frame(self) -> bytes | None:
-        # 1. Extreme Speed Streaming
-        if self._streaming and self.latest_frame_bytes:
-            return self.latest_frame_bytes
-            
-        # 2. Fast grab using adbutils socket instead of subprocess
-        if self.adb_device:
-            img = self.adb_device.screenshot()
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
-            
-        # 3. Slow Subprocess Fallback
-        try:
-            return self._run(self._adb("exec-out screencap -p"))
-        except:
-            return None
-
-    def tap(self, x, y):
-        cx, cy = int(x)+random.randint(-8,8), int(y)+random.randint(-8,8)
-        if self.adb_device:
-            self.adb_device.click(cx, cy)
-        else:
-            os.system(self._adb(f"shell input tap {cx} {cy}"))
-        time.sleep(self.config["tap_cooldown"] + random.uniform(0, 0.05))
-
-    def move_left(self):
-        y = self.h*0.5
-        if self.adb_device:
-            self.adb_device.swipe(int(self.w*.7), int(y), int(self.w*.3), int(y), 0.075)
-        else:
-            os.system(self._adb(f"shell input swipe {int(self.w*.7)} {int(y)} {int(self.w*.3)} {int(y)} 75"))
-        time.sleep(0.13)
-
-    def move_right(self):
-        y = self.h*0.5
-        if self.adb_device:
-            self.adb_device.swipe(int(self.w*.3), int(y), int(self.w*.7), int(y), 0.075)
-        else:
-            os.system(self._adb(f"shell input swipe {int(self.w*.3)} {int(y)} {int(self.w*.7)} {int(y)} 75"))
-        time.sleep(0.13)
-
-    def jump(self):
-        self.tap(self.w*0.5, self.h*0.35)
-
-    def pixel_reflex(self, frame_bytes: bytes | None) -> str | None:
-        if not VISION_AVAILABLE or frame_bytes is None: return None
-        try:
-            arr   = np.frombuffer(frame_bytes, dtype=np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if frame is None: return None
-            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # 1. Advanced Mode: Multi-Scale Template Matching
-            action_found = None
-            if self.templates:
-                for t_name, t_img in self.templates.items():
-                    if t_img is None: continue
-                    # Multi-scale check: Horizon (small), Mid (normal), Danger (large)
-                    scales = [0.75, 1.0, 1.25]
-                    for scale in scales:
-                        scaled_t = cv2.resize(t_img, (0,0), fx=scale, fy=scale)
-                        res = cv2.matchTemplate(gray, scaled_t, cv2.TM_CCOEFF_NORMED)
-                        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-                        if max_val > 0.75:  # Confidence threshold
-                            
-                            x_center = max_loc[0] + (scaled_t.shape[1] // 2)
-                            y_center = max_loc[1] + (scaled_t.shape[0] // 2)
-                            
-                            # Vector Tracking Logic (Time to Collision estimate)
-                            if y_center > self.h * 0.4: # Only react if it's descending past horizon
-                                if x_center < self.w * 0.4:
-                                    action_found = "MOVE RIGHT" 
-                                elif x_center > self.w * 0.6:
-                                    action_found = "MOVE LEFT"  
-                                else:
-                                    action_found = "JUMP"       
-                                return action_found
-
-            # If no templates found, assume "No Road"
-            # 2. Phase 2 Gemini Supervisor Recovery
-            now = time.time()
-            if action_found is None and (now - self._last_ai_ts) > 5.0 and self.ai_available:
-                self._last_ai_ts = now
-                if not getattr(self, '_ai_active', False):
-                    self._ai_active = True
-                    def _run_sup():
-                        try:
-                            p = (
-                                "You are a supervisor AI for an endless runner bot. "
-                                "The bot is stuck and not seeing any game obstacles. "
-                                "Look at this screen. Are we in a menu? Is there an ad? "
-                                "If you see a 'Play', 'Close', 'X', or 'Try Again' button, OUTPUT ONLY the coordinates as: TAP [x] [y]\n"
-                                "If you see gameplay (we are just safely running), OUTPUT EXACTLY: NONE\n"
-                                "If we died, OUTPUT EXACTLY: JUMP\n"
-                            )
-                            print("🧠 No road detected for 5s. Triggering Gemini Supervisor...")
-                            res = call_ai(self.config, p, frame_bytes)
-                            if res:
-                                res = res.strip()
-                                if "TAP" in res or "JUMP" in res:
-                                    self.execute(res, "SUPERVISOR")
-                        finally:
-                            self._ai_active = False
-                    threading.Thread(target=_run_sup, daemon=True).start()
-
-            # 3. Fallback Mode: Basic Pixel Brightness (Lane detection)
-            r1y1,r1y2,r1x1,r1x2 = self.left_roi
-            r2y1,r2y2,r2x1,r2x2 = self.right_roi
-            lc = int(np.sum(gray[r1y1:r1y2, r1x1:r1x2] > 215))
-            rc = int(np.sum(gray[r2y1:r2y2, r2x1:r2x2] > 215))
-            if lc > 350 and lc >= rc: return "MOVE RIGHT"
-            elif rc > 350:            return "MOVE LEFT"
-        except Exception as e:
-            print(f"Reflex error: {e}")
-        return None
-
-    def ai_decide(self, frame_bytes: bytes | None) -> str | None:
-        # User only wants AI to learn the game initially, then OpenCV to play it.
-        # If we already have rules, the AI should stop interfering with the gameplay loop.
-        if not self.config["use_ai"] or not self.ai_available or frame_bytes is None: return None
-        if len(self.kb.get("rules", [])) > 0: return None
-        
-        now = time.time()
-        if now - self._last_ai_ts < AI_CALL_INTERVAL: return None
-        if getattr(self, '_ai_active', False): return None
-        
-        self._last_ai_ts = now
-        self._ai_active = True
-        
-        def _run_ai():
-            try:
-                prompt = build_game_prompt(self.game_state, self.recent_moves, self.kb)
-                result = call_ai(self.config, prompt, frame_bytes)
-                if result: 
-                    print(f"🤖 AI [{self.game_state}] → {result}")
-                    self.execute(result, "AI")
-            finally:
-                self._ai_active = False
-                
-        threading.Thread(target=_run_ai, daemon=True).start()
-        return None
-
-    def execute(self, command: str, source: str = "AI"):
-        cmd = command.upper().strip()
-        if not cmd or cmd == "NONE": return
-        self.recent_moves.append(cmd)
-        if len(self.recent_moves) > 10: self.recent_moves.pop(0)
-
-        # Update game state heuristic based on command
-        if "TAP" in cmd and self.game_state in ("DEAD","MAIN_MENU","REWARD","UNKNOWN","LOADING"):
-            self.game_state = "LOADING"
-        elif "MOVE" in cmd or "JUMP" in cmd:
-            self.game_state = "PLAYING"
-
-        # Force state updates to prevent "UNKNOWN" lock
-        if self.game_state == "UNKNOWN" and cmd != "NONE":
-             self.game_state = "MAIN_MENU" if "TAP" in cmd else "PLAYING"
-
-        self.kb.setdefault("new_observations", []).append(f"[{self.game_state}] {source}→{cmd}")
-        
-        if   "MOVE LEFT"  in cmd: self.move_left()
-        elif "MOVE RIGHT" in cmd: self.move_right()
-        elif "JUMP"       in cmd: self.jump()
-        elif cmd.startswith("TAP"):
-            parts = cmd.replace("[","").replace("]","").split()
-            try:    self.tap(float(parts[1]), float(parts[2]))
-            except: self.tap(self.w*0.5, self.h*0.5)
-
-    def start_loop(self):
-        print(f"\n🧠 BunnyBot starting up! Active AI: {self.config.get('active_ai', 'OPENROUTER')}")
-        print("   Switch to the game now!")
-        for i in range(5, 0, -1):
-            print(f"   Starting in {i}s...", end="\r", flush=True)
+    def run(self):
+        delay = CFG["startup_delay"]
+        print(f"[BOT] Starting in {delay}s — SWITCH TO THE GAME NOW!")
+        for i in range(delay, 0, -1):
+            print(f"  {i}…", end="\r", flush=True)
             time.sleep(1)
-        print("\n🚀 Live! (Ctrl+C to stop)\n")
+        print("[BOT] 🐰  GO!  (Ctrl+C to stop)\n")
 
-        if self.ai_available and not self.kb.get("game_summary"):
-            try: phase1_learn_game(self.config, self.get_frame(), self.kb)
-            except Exception as e: print(f"⚠️  Phase 1 skipped: {e}")
+        if CFG["debug_save_frames"]:
+            os.makedirs("debug_frames", exist_ok=True)
 
-        try:
-            while True:
-                try:
-                    frame = self.get_frame()
-                    self._fail_streak = 0
-                except Exception as e:
-                    self._fail_streak += 1
-                    print(f"⚠️  Capture fail: {e}")
-                    if self._fail_streak >= 3: break
-                    time.sleep(1); continue
+        self.start_time = time.time()
+        period = 1.0 / max(1, CFG["loop_fps"])
 
-                # Starts background learning thread if applicable
-                self.ai_decide(frame)
-                    
-                reflex = self.pixel_reflex(frame)
-                if reflex:
-                    print(f"⚡ Reflex → {reflex}")
-                    self.execute(reflex, "Reflex")
+        while True:
+            t0 = time.time()
+            try:
+                self._tick()
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"[WARN] Tick error: {e}")
+                if CFG["debug"]:
+                    traceback.print_exc()
+                time.sleep(0.3)
 
-                time.sleep(LOOP_INTERVAL)
+            spare = period - (time.time() - t0)
+            if spare > 0:
+                time.sleep(spare)
 
-        except KeyboardInterrupt:
-            print("\n\n🛑 Stopped.")
-        finally:
-            if self.ai_available and self.kb.get("new_observations"):
-                phase3_consolidate(self.config, self.kb)
+    # ── Single frame ─────────────────────────────────────────────────────────
+
+    def _tick(self):
+        self.frame_count += 1
+
+        frame = self.adb.screencap()
+        if frame is None:
+            self.consecutive_fails += 1
+            if self.consecutive_fails >= 10:
+                print("[WARN] 10 capture failures — retrying ADB connection…")
+                self.adb.auto_connect()
+                self.consecutive_fails = 0
+            return
+        self.consecutive_fails = 0
+
+        h, w = frame.shape[:2]
+        self.screen_w = w
+        self.screen_h = h
+
+        action, dbg = self.vision.decide(frame)
+        self._execute(action, w, h)
+
+        if CFG["debug"]:
+            fps = self.frame_count / max(time.time() - self.start_time, 1)
+            pl  = dbg.get("path_L",   "-")
+            pr  = dbg.get("path_R",   "-")
+            fl  = dbg.get("fence_L",  "-")
+            fr  = dbg.get("fence_R",  "-")
+            rsn = dbg.get("reason",   "")
+            print(f"[{self.frame_count:05d}] {action:<8}  {rsn:<32}"
+                  f"  pathL/R={pl}/{pr}  fenceL/R={fl}/{fr}  {fps:.1f}fps")
+
+        if CFG["debug_save_frames"]:
+            self._save_debug(frame, action, dbg, w, h)
+
+    # ── Execute action ───────────────────────────────────────────────────────
+
+    def _execute(self, action: str, w: int, h: int):
+        now = time.time()
+
+        if action == "RESTART":
+            print("[BOT] Game over — tapping to restart…")
+            time.sleep(0.8)
+            self.adb.tap(w // 2, int(h * 0.72))
+            time.sleep(1.2)
+            self.last_act_time = time.time()
+            return
+
+        # Cooldown guard — don't spam swipes
+        if now - self.last_act_time < CFG["action_cooldown"]:
+            return
+
+        if action == "LEFT":
+            self.adb.swipe_left(w, h)
+            self.last_act_time = now
+            self.last_action   = "LEFT"
+
+        elif action == "RIGHT":
+            self.adb.swipe_right(w, h)
+            self.last_act_time = now
+            self.last_action   = "RIGHT"
+
+        # "STRAIGHT" → no input
+
+    # ── Debug frame annotator ────────────────────────────────────────────────
+
+    def _save_debug(self, frame, action: str, dbg: dict, w: int, h: int):
+        vis = frame.copy()
+
+        # Lookahead strip  (green)
+        ly1 = int(CFG["la_top"]    * h)
+        ly2 = int(CFG["la_bottom"] * h)
+        cv2.rectangle(vis, (0, ly1), (w, ly2),     (0, 200, 0), 2)
+        cv2.line(vis, (w // 2, ly1), (w // 2, ly2), (0, 255, 255), 1)
+
+        # Danger zones  (red)
+        lx1 = int(CFG["dz_left_x"][0]  * w);  lx2 = int(CFG["dz_left_x"][1]  * w)
+        rx1 = int(CFG["dz_right_x"][0] * w);  rx2 = int(CFG["dz_right_x"][1] * w)
+        zy1 = int(CFG["dz_y"][0] * h);         zy2 = int(CFG["dz_y"][1] * h)
+        cv2.rectangle(vis, (lx1, zy1), (lx2, zy2), (0, 0, 220), 2)
+        cv2.rectangle(vis, (rx1, zy1), (rx2, zy2), (0, 0, 220), 2)
+
+        # Action label
+        colour = {"LEFT": (0, 165, 255), "RIGHT": (0, 165, 255),
+                  "RESTART": (0, 0, 255), "STRAIGHT": (0, 220, 0)}.get(action, (200, 200, 200))
+        cv2.putText(vis, action, (20, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.8, colour, 4)
+        cv2.putText(vis, dbg.get("reason", ""), (20, 105),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+        cv2.imwrite(
+            f"debug_frames/{self.frame_count:06d}_{action}.jpg",
+            vis,
+            [cv2.IMWRITE_JPEG_QUALITY, 65]
+        )
+
+    # ── Session stats ────────────────────────────────────────────────────────
+
+    def print_stats(self):
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / max(elapsed, 1)
+        print(f"\n[BOT] Stopped after {elapsed:.0f}s  |"
+              f"  {self.frame_count} frames  |  avg {fps:.1f} fps")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE MENU
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BANNER = """\n╔══════════════════════════════════════════════════════════════╗
+║         🐰  BunnyBot — Bunny Runner 3D  (Pure OpenCV)       ║
+╚══════════════════════════════════════════════════════════════╝"""
+
+
+def show_menu(bot):
+    dev = CFG["device"] or "(auto-detect)"
+    dbg = "ON" if CFG["debug"] else "OFF"
+    sav = "ON" if CFG["debug_save_frames"] else "OFF"
+    print(f"""
+┌──────────────────────────────────────────────────┐
+│  Device          : {dev:<30}│
+│  Loop FPS        : {CFG['loop_fps']:<30}│
+│  Swipe           : {CFG['swipe_ms']}ms  /  {CFG['swipe_px']}px{"":<17}│
+│  Action cooldown : {CFG['action_cooldown']}s{"":<27}│
+│  Debug log       : {dbg:<30}│
+│  Save frames     : {sav:<30}│
+├──────────────────────────────────────────────────┤
+│  1  Set target device (blank = auto)             │
+│  2  Change loop FPS              (default 10)    │
+│  3  Change swipe speed / distance                │
+│  4  Change action cooldown       (default 0.20s) │
+│  5  Toggle debug logging                         │
+│  6  Toggle save debug frames                     │
+│  7  Change game package name                     │
+│  8  Adjust fence pixel threshold (default 280)   │
+│  9  Adjust path deadband         (default 12%)   │
+│                                                  │
+│  C  Calibrate path colour from live screen       │
+│  S  START the bot                                │
+│  Q  Quit                                         │
+└──────────────────────────────────────────────────┘""")
+
+
+def menu():
+    print(BANNER)
+    bot = BunnyBot()
+
+    while True:
+        show_menu(bot)
+        c = input("  Option: ").strip().lower()
+
+        if c == "1":
+            v = input("  Device IP:PORT (blank = auto): ").strip()
+            CFG["device"] = v
+            bot.adb = ADB(v)
+
+        elif c == "2":
+            try:
+                v = int(input(f"  FPS 1–30 [current {CFG['loop_fps']}]: "))
+                CFG["loop_fps"] = max(1, min(30, v))
+            except ValueError:
+                print("  Not a valid number.")
+
+        elif c == "3":
+            try:
+                ms = int(input(f"  Swipe duration ms [current {CFG['swipe_ms']}]: "))
+                px = int(input(f"  Swipe distance px [current {CFG['swipe_px']}]: "))
+                CFG["swipe_ms"] = max(20, ms)
+                CFG["swipe_px"] = max(50, px)
+            except ValueError:
+                print("  Not valid numbers.")
+
+        elif c == "4":
+            try:
+                v = float(input(f"  Cooldown seconds [current {CFG['action_cooldown']}]: "))
+                CFG["action_cooldown"] = max(0.05, v)
+            except ValueError:
+                print("  Not a valid number.")
+
+        elif c == "5":
+            CFG["debug"] = not CFG["debug"]
+            print(f"  Debug logging: {'ON' if CFG['debug'] else 'OFF'}")
+
+        elif c == "6":
+            CFG["debug_save_frames"] = not CFG["debug_save_frames"]
+            print(f"  Frame saving: {'ON' if CFG['debug_save_frames'] else 'OFF'}")
+
+        elif c == "7":
+            v = input(f"  Package [current: {CFG['game_package']}]: ").strip()
+            if v:
+                CFG["game_package"] = v
+
+        elif c == "8":
+            try:
+                v = int(input(f"  Fence threshold [current {CFG['fence_px_threshold']}]: "))
+                CFG["fence_px_threshold"] = max(10, v)
+            except ValueError:
+                print("  Not a valid number.")
+
+        elif c == "9":
+            try:
+                v = float(input(f"  Deadband % 1–49 [current {CFG['path_deadband']*100:.0f}]: "))
+                CFG["path_deadband"] = max(0.01, min(0.49, v / 100))
+            except ValueError:
+                print("  Not a valid number.")
+
+        elif c == "c":
+            print("  Setting up — open the game to a running screen first…")
+            if not bot.setup():
+                print("  Fix device connection first.")
+                continue
+            frame = bot.adb.screencap()
+            if frame is not None:
+                lo, hi = bot.vision.calibrate(frame)
+                if input("  Apply these values now? [y/N]: ").strip().lower() == "y":
+                    CFG["path_hsv_lo"] = lo
+                    CFG["path_hsv_hi"] = hi
+                    print("  ✓ Path colour updated for this session.")
+                    print("    (Copy them into CFG in the script to make permanent.)")
             else:
-                self.kb["session_count"] = self.kb.get("session_count", 0) + 1
-                self.kb["new_observations"] = []
-                save_knowledge(self.kb)
+                print("  Screen capture failed.")
+
+        elif c == "s":
+            if not bot.setup():
+                print("\n  Fix the issues above and try again.\n")
+                continue
+            try:
+                bot.run()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                bot.print_stats()
+            bot._reset_state()   # allow re-running without restarting script
+
+        elif c == "q":
+            print("  Bye! 🐰\n")
+            sys.exit(0)
+
+        else:
+            print("  Unknown option.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    cfg = load_config()
-    kb  = load_knowledge()
-    cfg = main_menu(cfg, kb)
-    BunnyBotAI(cfg, kb).start_loop()
+    # Pass device as CLI arg:  python bunny_bot.py 192.168.1.10:38765
+    if len(sys.argv) > 1 and ":" in sys.argv[1]:
+        CFG["device"] = sys.argv[1]
+        print(f"[CLI] Device: {CFG['device']}")
+    menu()
