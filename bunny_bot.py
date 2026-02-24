@@ -360,7 +360,7 @@ class BunnyBotAI:
         self.tap(self.w*0.5, self.h*0.35)
 
     def pixel_reflex(self, frame_bytes: bytes) -> str | None:
-        if not VISION_AVAILABLE or self.game_state != "PLAYING": return None
+        if not VISION_AVAILABLE: return None
         try:
             arr   = np.frombuffer(frame_bytes, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
