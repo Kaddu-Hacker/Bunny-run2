@@ -12,7 +12,14 @@ import io
 import threading
 import struct
 import socket
+import asyncio
 
+try:
+    from putergenai import PuterClient
+    PUTER_AVAILABLE = True
+except ImportError:
+    PUTER_AVAILABLE = False
+    
 try:
     import av # type: ignore
     PYAV_AVAILABLE = True
@@ -35,13 +42,7 @@ LOOP_INTERVAL    = 0.08
 CONFIG_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 KNOWLEDGE_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_knowledge.json")
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODELS = [
-    "google/gemma-3-27b-it:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "google/gemma-3-12b-it:free"
-]
-GOOGLE_URL     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+PUTER_MODEL      = "gemini-3.1-pro-preview"
 
 try:
     import cv2, numpy as np
@@ -108,76 +109,34 @@ def save_knowledge(kb: dict):
 #  AI CALLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_openrouter(api_key: str, prompt: str, frame_b64: str | None = None) -> str | None:
-    content = []
-    if frame_b64:
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{frame_b64}"}})
-    content.append({"type": "text", "text": prompt})
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    for index, model in enumerate(OPENROUTER_MODELS):
-        if index > 0:
-            print(f"🔄 Trying OpenRouter Fallback ({model})...")
-            
-        payload = {
-            "model":       model,
-            "max_tokens":  60,
-            "temperature": 0.2,
-            "messages":    [{"role": "user", "content": content}],
-        }
-        try:
-            r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=10)
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            if index == 0:
-                print(f"⚠️  OpenRouter Primary ({model}) failed: {e}")
-            else:
-                print(f"⚠️  OpenRouter Fallback ({model}) failed: {e}")
-                
-    return None
-
-def _call_google(api_key: str, prompt: str, frame_b64: str | None = None) -> str | None:
-    parts: list[dict] = []
-    if frame_b64:
-        parts.append({"inline_data": {"mime_type": "image/png", "data": frame_b64}})
-    parts.append({"text": prompt})
-
-    payload = {"contents": [{"parts": parts}]}
-    url = f"{GOOGLE_URL}?key={api_key}"
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        print(f"⚠️  Google AI: {e}")
-        return None
-
 def call_ai(cfg: dict, prompt: str, frame_bytes: bytes | None = None) -> str | None:
+    if not PUTER_AVAILABLE:
+        print("⚠️  putergenai is not installed. AI is disabled.")
+        return None
+        
     b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else None
-    
-    # Try the specified active AI first
-    if cfg.get("active_ai") == "OPENROUTER" and cfg.get("openrouter_key"):
-        res = _call_openrouter(cfg["openrouter_key"], prompt, b64)
-        if res: return res
-        print("⚠️  OpenRouter failed, trying Google fallback...")
-        if cfg.get("google_key"):
-            return _call_google(cfg["google_key"], prompt, b64)
 
-    elif cfg.get("active_ai") == "GOOGLE" and cfg.get("google_key"):
-        res = _call_google(cfg["google_key"], prompt, b64)
-        if res: return res
-        print("⚠️  Google failed, trying OpenRouter fallback...")
-        if cfg.get("openrouter_key"):
-            return _call_openrouter(cfg["openrouter_key"], prompt, b64)
+    async def _do_call() -> str | None:
+        try:
+            client = PuterClient()
+            img_url = f"data:image/png;base64,{b64}" if b64 else None
             
-    # Fallback to whatever is available if active_ai is not set properly, or fallback from above failed
-    if cfg.get("openrouter_key"): return _call_openrouter(cfg["openrouter_key"], prompt, b64)
-    if cfg.get("google_key"): return _call_google(cfg["google_key"], prompt, b64)
-    
-    return None
+            res = await client.ai_chat(
+                prompt=prompt,
+                image_url=img_url,
+                options={"model": PUTER_MODEL}
+            )
+            return res.get("message", {}).get("content", "").strip()
+        except Exception as e:
+            print(f"⚠️  PuterGenAI Bridge failed: {e}")
+            return None
+            
+    # Bridge sync to async
+    try:
+        return asyncio.run(_do_call())
+    except Exception as e:
+        print(f"⚠️  Event loop error: {e}")
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LEARNING SYSTEM
@@ -365,7 +324,7 @@ class BunnyBotAI:
             
         # Try loading template images for OpenCV
         self.templates = {}
-        for t_name in ["barrier", "car", "hole"]:
+        for t_name in ["fence", "carrot", "rabbit"]:
             t_path = os.path.join(os.path.dirname(__file__), f"template_{t_name}.png")
             if os.path.exists(t_path):
                 self.templates[t_name] = cv2.imread(t_path, cv2.IMREAD_GRAYSCALE)
@@ -406,6 +365,7 @@ class BunnyBotAI:
             
             codec = av.CodecContext.create('h264', 'r')
             while self._streaming:
+                time.sleep(0.01) # Optimize Termux CPU usage
                 # Scrcpy protocol video header: pts (8 bytes) + packet size (4 bytes)
                 header = s.recv(12)
                 if len(header) < 12: break
