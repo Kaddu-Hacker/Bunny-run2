@@ -326,7 +326,10 @@ class BunnyBotAI:
         self.left_roi  = (int(self.h*0.65), int(self.h*0.75), int(self.w*0.10), int(self.w*0.45))
         self.right_roi = (int(self.h*0.65), int(self.h*0.75), int(self.w*0.55), int(self.w*0.90))
 
-    def _adb(self, cmd): return f"adb {('-s '+self.config['device_id']+' ') if self.config.get('device_id') else ''}{cmd}"
+    def _adb(self, cmd):
+        dev = f"-s {self.config['device_id']} " if self.config.get('device_id') else ""
+        return f"adb {dev}{cmd}"
+        
     def _run(self, cmd): return subprocess.check_output(cmd, shell=True)
 
     def _get_resolution(self):
@@ -373,7 +376,11 @@ class BunnyBotAI:
         return None
 
     def ai_decide(self, frame_bytes: bytes) -> str | None:
+        # User only wants AI to learn the game initially, then OpenCV to play it.
+        # If we already have rules, the AI should stop interfering with the gameplay loop.
         if not self.config["use_ai"] or not self.ai_available: return None
+        if len(self.kb.get("rules", [])) > 0: return None
+        
         now = time.time()
         if now - self._last_ai_ts < AI_CALL_INTERVAL: return None
         self._last_ai_ts = now
@@ -435,8 +442,8 @@ class BunnyBotAI:
                 if ai_cmd:
                     self.execute(ai_cmd, "AI")
                     time.sleep(LOOP_INTERVAL)
-                    continue
-
+                    # Do not block reflex if AI is active
+                    
                 reflex = self.pixel_reflex(frame)
                 if reflex:
                     print(f"⚡ Reflex → {reflex}")
