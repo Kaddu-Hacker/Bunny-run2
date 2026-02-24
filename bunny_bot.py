@@ -339,6 +339,7 @@ class BunnyBotAI:
         self._last_ai_ts  = 0.0
         self._fail_streak = 0
         self.ai_available = bool(config.get("openrouter_key") or config.get("google_key"))
+        self._ai_active   = False
         
         # Init ADB connection (fast socket access)
         self.adb_device = None
@@ -353,8 +354,6 @@ class BunnyBotAI:
                     print(f"✅ ADB connected via adbutils to: {self.adb_device.serial}")
             except Exception as e:
                 print(f"⚠️  adbutils connection failed: {e}")
-
-        self._get_resolution()
 
         self._get_resolution()
         
@@ -438,6 +437,17 @@ class BunnyBotAI:
         return f"adb {dev}{cmd}"
         
     def _run(self, cmd): return subprocess.check_output(cmd, shell=True)
+
+    def _get_resolution(self):
+        try:
+            if getattr(self, 'adb_device', None) and hasattr(self.adb_device, 'window_size'):
+                info = self.adb_device.window_size()
+                self.w, self.h = info.width, info.height
+            else:
+                raw = self._run(self._adb("shell wm size")).decode()
+                self.w, self.h = map(int, raw.split(":")[-1].strip().split("x"))
+        except Exception:
+            self.w, self.h = 1080, 2400
     
     def get_frame(self) -> bytes | None:
         # 1. Extreme Speed Streaming
@@ -523,18 +533,27 @@ class BunnyBotAI:
             now = time.time()
             if action_found is None and (now - self._last_ai_ts) > 5.0 and self.ai_available:
                 self._last_ai_ts = now
-                p = (
-                    "You are a supervisor AI for an endless runner bot. "
-                    "The bot is stuck and not seeing any game obstacles. "
-                    "Look at this screen. Are we in a menu? Is there an ad? "
-                    "If you see a 'Play', 'Close', 'X', or 'Try Again' button, OUTPUT ONLY the coordinates as: TAP [x] [y]\n"
-                    "If you see gameplay (we are just safely running), OUTPUT EXACTLY: NONE\n"
-                    "If we died, OUTPUT EXACTLY: JUMP\n"
-                )
-                print("🧠 No road detected for 5s. Triggering Gemini Supervisor...")
-                res = call_ai(self.config, p, frame_bytes)
-                if res and "TAP" in res: return res.strip()
-                if res and "JUMP" in res: return "JUMP"
+                if not getattr(self, '_ai_active', False):
+                    self._ai_active = True
+                    def _run_sup():
+                        try:
+                            p = (
+                                "You are a supervisor AI for an endless runner bot. "
+                                "The bot is stuck and not seeing any game obstacles. "
+                                "Look at this screen. Are we in a menu? Is there an ad? "
+                                "If you see a 'Play', 'Close', 'X', or 'Try Again' button, OUTPUT ONLY the coordinates as: TAP [x] [y]\n"
+                                "If you see gameplay (we are just safely running), OUTPUT EXACTLY: NONE\n"
+                                "If we died, OUTPUT EXACTLY: JUMP\n"
+                            )
+                            print("🧠 No road detected for 5s. Triggering Gemini Supervisor...")
+                            res = call_ai(self.config, p, frame_bytes)
+                            if res:
+                                res = res.strip()
+                                if "TAP" in res or "JUMP" in res:
+                                    self.execute(res, "SUPERVISOR")
+                        finally:
+                            self._ai_active = False
+                    threading.Thread(target=_run_sup, daemon=True).start()
 
             # 3. Fallback Mode: Basic Pixel Brightness (Lane detection)
             r1y1,r1y2,r1x1,r1x2 = self.left_roi
@@ -553,14 +572,25 @@ class BunnyBotAI:
         if not self.config["use_ai"] or not self.ai_available or frame_bytes is None: return None
         if len(self.kb.get("rules", [])) > 0: return None
         
-        
         now = time.time()
         if now - self._last_ai_ts < AI_CALL_INTERVAL: return None
+        if getattr(self, '_ai_active', False): return None
+        
         self._last_ai_ts = now
-        prompt = build_game_prompt(self.game_state, self.recent_moves, self.kb)
-        result = call_ai(self.config, prompt, frame_bytes)
-        if result: print(f"🤖 AI [{self.game_state}] → {result}")
-        return result
+        self._ai_active = True
+        
+        def _run_ai():
+            try:
+                prompt = build_game_prompt(self.game_state, self.recent_moves, self.kb)
+                result = call_ai(self.config, prompt, frame_bytes)
+                if result: 
+                    print(f"🤖 AI [{self.game_state}] → {result}")
+                    self.execute(result, "AI")
+            finally:
+                self._ai_active = False
+                
+        threading.Thread(target=_run_ai, daemon=True).start()
+        return None
 
     def execute(self, command: str, source: str = "AI"):
         cmd = command.upper().strip()
@@ -611,11 +641,8 @@ class BunnyBotAI:
                     if self._fail_streak >= 3: break
                     time.sleep(1); continue
 
-                ai_cmd = self.ai_decide(frame)
-                if ai_cmd:
-                    self.execute(ai_cmd, "AI")
-                    time.sleep(LOOP_INTERVAL)
-                    # Do not block reflex if AI is active
+                # Starts background learning thread if applicable
+                self.ai_decide(frame)
                     
                 reflex = self.pixel_reflex(frame)
                 if reflex:
