@@ -9,6 +9,15 @@ import random
 from datetime import datetime
 import requests
 import io
+import threading
+import struct
+import socket
+
+try:
+    import av # type: ignore
+    PYAV_AVAILABLE = True
+except ImportError:
+    PYAV_AVAILABLE = False
 
 try:
     import adbutils
@@ -174,7 +183,8 @@ def call_ai(cfg: dict, prompt: str, frame_bytes: bytes | None = None) -> str | N
 #  LEARNING SYSTEM
 # ─────────────────────────────────────────────────────────────────────────────
 
-def phase1_learn_game(cfg: dict, frame_bytes: bytes, kb: dict):
+def phase1_learn_game(cfg: dict, frame_bytes: bytes | None, kb: dict):
+    if frame_bytes is None: return
     print("\n🎓 First run — AI is learning the game from the screen...")
     prompt = (
         "You are analyzing a mobile game called 'Bunny Runner 3D'.\n"
@@ -344,6 +354,16 @@ class BunnyBotAI:
             except Exception as e:
                 print(f"⚠️  adbutils connection failed: {e}")
 
+        self._get_resolution()
+
+        self._get_resolution()
+        
+        # Init Scrcpy Stream Buffer
+        self.latest_frame_bytes = None
+        self._streaming = False
+        if PYAV_AVAILABLE and self.adb_device:
+            self.start_scrcpy_stream()
+            
         # Try loading template images for OpenCV
         self.templates = {}
         for t_name in ["barrier", "car", "hole"]:
@@ -351,35 +371,91 @@ class BunnyBotAI:
             if os.path.exists(t_path):
                 self.templates[t_name] = cv2.imread(t_path, cv2.IMREAD_GRAYSCALE)
                 
-        self._get_resolution()
         self.left_roi  = (int(self.h*0.65), int(self.h*0.75), int(self.w*0.10), int(self.w*0.45))
         self.right_roi = (int(self.h*0.65), int(self.h*0.75), int(self.w*0.55), int(self.w*0.90))
+
+    def start_scrcpy_stream(self):
+        print("🚀 Booting PyAV Scrcpy Stream...")
+        try:
+            # Push server
+            server_path = os.path.join(os.path.dirname(__file__), "scrcpy-server.jar")
+            if os.path.exists(server_path):
+                self.adb_device.sync.push(server_path, "/data/local/tmp/scrcpy-server.jar")
+                # Forward port
+                self.adb_device.forward("tcp:8081", "localabstract:scrcpy")
+                
+                # Start server in background
+                def run_server():
+                    cmd = "CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server 2.4 tunnel_forward=true control=false cleanup=false"
+                    self.adb_device.shell(cmd)
+                threading.Thread(target=run_server, daemon=True).start()
+                time.sleep(1) # wait for server bindings
+
+                self._streaming = True
+                threading.Thread(target=self._scrcpy_receiver_loop, daemon=True).start()
+                print("✅ PyAV Scrcpy Stream Thread Started.")
+            else:
+                print("⚠️ scrcpy-server.jar not found, falling back to adbutils screenshots.")
+        except Exception as e:
+            print(f"⚠️ Scrcpy stream init failed: {e}")
+            
+    def _scrcpy_receiver_loop(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect(("127.0.0.1", 8081))
+            _ = s.recv(68) # Dummy read for device name
+            
+            codec = av.CodecContext.create('h264', 'r')
+            while self._streaming:
+                # Scrcpy protocol video header: pts (8 bytes) + packet size (4 bytes)
+                header = s.recv(12)
+                if len(header) < 12: break
+                _, pkt_size = struct.unpack(">QI", header)
+                
+                pkt_data = bytearray()
+                while len(pkt_data) < pkt_size:
+                    chunk = s.recv(pkt_size - len(pkt_data))
+                    if not chunk: break
+                    pkt_data.extend(chunk)
+                    
+                packet = av.Packet(bytes(pkt_data))
+                frames = codec.decode(packet)
+                for frame in frames:
+                    # Convert raw NV12 to BGR numpy array
+                    img = frame.to_ndarray(format='bgr24')
+                    # Encode to PNG bytes so pixel_reflex interface stays consistent
+                    success, enc = cv2.imencode('.png', img)
+                    if success:
+                        self.latest_frame_bytes = enc.tobytes()
+        except Exception as e:
+            print(f"Scrcpy Stream Error: {e}")
+        finally:
+            s.close()
+            self._streaming = False
 
     def _adb(self, cmd):
         dev = f"-s {self.config['device_id']} " if self.config.get('device_id') else ""
         return f"adb {dev}{cmd}"
         
     def _run(self, cmd): return subprocess.check_output(cmd, shell=True)
-
-    def _get_resolution(self):
-        try:
-            if self.adb_device:
-                info = self.adb_device.window_size()
-                self.w, self.h = info.width, info.height
-            else:
-                raw = self._run(self._adb("shell wm size")).decode()
-                self.w, self.h = map(int, raw.split(":")[-1].strip().split("x"))
-        except Exception:
-            self.w, self.h = 1080, 2400
-
-    def get_frame(self) -> bytes:
-        # Fast grab using adbutils socket instead of subprocess
+    
+    def get_frame(self) -> bytes | None:
+        # 1. Extreme Speed Streaming
+        if self._streaming and self.latest_frame_bytes:
+            return self.latest_frame_bytes
+            
+        # 2. Fast grab using adbutils socket instead of subprocess
         if self.adb_device:
             img = self.adb_device.screenshot()
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             return buf.getvalue()
-        return self._run(self._adb("exec-out screencap -p"))
+            
+        # 3. Slow Subprocess Fallback
+        try:
+            return self._run(self._adb("exec-out screencap -p"))
+        except:
+            return None
 
     def tap(self, x, y):
         cx, cy = int(x)+random.randint(-8,8), int(y)+random.randint(-8,8)
@@ -408,32 +484,59 @@ class BunnyBotAI:
     def jump(self):
         self.tap(self.w*0.5, self.h*0.35)
 
-    def pixel_reflex(self, frame_bytes: bytes) -> str | None:
-        if not VISION_AVAILABLE: return None
+    def pixel_reflex(self, frame_bytes: bytes | None) -> str | None:
+        if not VISION_AVAILABLE or frame_bytes is None: return None
         try:
             arr   = np.frombuffer(frame_bytes, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if frame is None: return None
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-            # 1. Advanced Mode: Template Matching
+            # 1. Advanced Mode: Multi-Scale Template Matching
+            action_found = None
             if self.templates:
                 for t_name, t_img in self.templates.items():
                     if t_img is None: continue
-                    res = cv2.matchTemplate(gray, t_img, cv2.TM_CCOEFF_NORMED)
-                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-                    if max_val > 0.75:  # Confidence threshold
-                        # Determine lane based on x coordinate
-                        x_center = max_loc[0] + (t_img.shape[1] // 2)
-                        
-                        if x_center < self.w * 0.4:
-                            return "MOVE RIGHT" # Obstacle on left, move right
-                        elif x_center > self.w * 0.6:
-                            return "MOVE LEFT"  # Obstacle on right, move left
-                        else:
-                            return "JUMP"       # Obstacle in middle, jump
+                    # Multi-scale check: Horizon (small), Mid (normal), Danger (large)
+                    scales = [0.75, 1.0, 1.25]
+                    for scale in scales:
+                        scaled_t = cv2.resize(t_img, (0,0), fx=scale, fy=scale)
+                        res = cv2.matchTemplate(gray, scaled_t, cv2.TM_CCOEFF_NORMED)
+                        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                        if max_val > 0.75:  # Confidence threshold
+                            
+                            x_center = max_loc[0] + (scaled_t.shape[1] // 2)
+                            y_center = max_loc[1] + (scaled_t.shape[0] // 2)
+                            
+                            # Vector Tracking Logic (Time to Collision estimate)
+                            if y_center > self.h * 0.4: # Only react if it's descending past horizon
+                                if x_center < self.w * 0.4:
+                                    action_found = "MOVE RIGHT" 
+                                elif x_center > self.w * 0.6:
+                                    action_found = "MOVE LEFT"  
+                                else:
+                                    action_found = "JUMP"       
+                                return action_found
 
-            # 2. Fallback Mode: Basic Pixel Brightness (Lane detection)
+            # If no templates found, assume "No Road"
+            # 2. Phase 2 Gemini Supervisor Recovery
+            now = time.time()
+            if action_found is None and (now - self._last_ai_ts) > 5.0 and self.ai_available:
+                self._last_ai_ts = now
+                p = (
+                    "You are a supervisor AI for an endless runner bot. "
+                    "The bot is stuck and not seeing any game obstacles. "
+                    "Look at this screen. Are we in a menu? Is there an ad? "
+                    "If you see a 'Play', 'Close', 'X', or 'Try Again' button, OUTPUT ONLY the coordinates as: TAP [x] [y]\n"
+                    "If you see gameplay (we are just safely running), OUTPUT EXACTLY: NONE\n"
+                    "If we died, OUTPUT EXACTLY: JUMP\n"
+                )
+                print("🧠 No road detected for 5s. Triggering Gemini Supervisor...")
+                res = call_ai(self.config, p, frame_bytes)
+                if res and "TAP" in res: return res.strip()
+                if res and "JUMP" in res: return "JUMP"
+
+            # 3. Fallback Mode: Basic Pixel Brightness (Lane detection)
             r1y1,r1y2,r1x1,r1x2 = self.left_roi
             r2y1,r2y2,r2x1,r2x2 = self.right_roi
             lc = int(np.sum(gray[r1y1:r1y2, r1x1:r1x2] > 215))
@@ -444,11 +547,12 @@ class BunnyBotAI:
             print(f"Reflex error: {e}")
         return None
 
-    def ai_decide(self, frame_bytes: bytes) -> str | None:
+    def ai_decide(self, frame_bytes: bytes | None) -> str | None:
         # User only wants AI to learn the game initially, then OpenCV to play it.
         # If we already have rules, the AI should stop interfering with the gameplay loop.
-        if not self.config["use_ai"] or not self.ai_available: return None
+        if not self.config["use_ai"] or not self.ai_available or frame_bytes is None: return None
         if len(self.kb.get("rules", [])) > 0: return None
+        
         
         now = time.time()
         if now - self._last_ai_ts < AI_CALL_INTERVAL: return None
