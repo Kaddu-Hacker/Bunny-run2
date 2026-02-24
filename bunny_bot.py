@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   🐰  BunnyBot v6 — Bunny Runner 3D                                ║
-║   Persistent Settings  •  Guided Tuning  •  Granular Controls      ║
+║   🐰  BunnyBot v7 — Bunny Runner 3D                                ║
+║   Auto-Calibration  •  Adaptive Self-Tuning  •  Guided Controls    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 HOW THE BOT WORKS (read this once!)
@@ -77,7 +77,7 @@ SAVEABLE_KEYS = {
     "fence_edge_ratio", "fence_min_signals",
     "gameover_dark_frac", "gameover_dark_v_max", "gameover_bright_px",
     "vote_confirm", "debug", "debug_save_frames",
-    "night_light_shift",
+    "night_light_shift", "adaptive_tuning",
 }
 
 def save_settings(cfg):
@@ -197,7 +197,10 @@ _DEFAULTS = {
     "debug_save_frames": False,
 
     # Night light tracking
-    "night_light_shift": 0,      # cumulative H shift applied so far
+    "night_light_shift": 0,
+
+    # Adaptive self-tuning
+    "adaptive_tuning": True,     # auto-adjust deadbands based on performance
 }
 
 # Working config — copy of defaults, then overridden by saved file
@@ -707,6 +710,316 @@ class Vision:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  AUTO CALIBRATOR
+#  Samples a real gameplay screenshot and sets colour ranges automatically.
+#  Strategy:
+#    - Divides the lookahead strip into left-edge / centre / right-edge bands
+#    - Left & right edges are almost always GRASS in normal gameplay
+#    - Centre is almost always PATH
+#    - Top-left/right corners of danger zones contain FENCE when posts are present
+#    - Fits HSV ranges around the median colours found ± tolerance
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AutoCalibrator:
+    # Tolerance added around sampled median values
+    H_TOL = 14   # ±14 hue units
+    S_TOL = 55   # ±55 saturation units
+    V_TOL = 55   # ±55 value units
+
+    def calibrate(self, frame):
+        """
+        Analyse a gameplay frame and return updated colour ranges.
+        Returns dict of updated CFG keys, or None if frame looks wrong.
+        """
+        h, w = frame.shape[:2]
+        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # ── Sample regions ────────────────────────────────────────────────────
+        # Lookahead strip bounds
+        ly1 = int(CFG["la_top"]    * h)
+        ly2 = int(CFG["la_bottom"] * h)
+        strip_h = ly2 - ly1
+
+        # Grass: left 15% and right 15% of lookahead strip
+        grass_left  = hsv[ly1:ly2,  :int(w*0.15)]
+        grass_right = hsv[ly1:ly2,   int(w*0.85):]
+        grass_pixels = np.vstack([
+            grass_left.reshape(-1, 3),
+            grass_right.reshape(-1, 3)
+        ])
+
+        # Path: centre 20% of lookahead strip, bottom half of strip
+        cx1 = int(w * 0.40); cx2 = int(w * 0.60)
+        path_pixels = hsv[ly1 + strip_h//2 : ly2, cx1:cx2].reshape(-1, 3)
+
+        # Fence: sample top rows of both danger zones
+        lx1 = int(CFG["dz_left_x"][0]  * w); lx2 = int(CFG["dz_left_x"][1]  * w)
+        rx1 = int(CFG["dz_right_x"][0] * w); rx2 = int(CFG["dz_right_x"][1] * w)
+        zy1 = int(CFG["dz_y"][0] * h)
+        fence_h = max(1, int(0.08 * h))   # top 8% of danger zone
+        fence_left  = hsv[zy1:zy1+fence_h,  lx1:lx2].reshape(-1, 3)
+        fence_right = hsv[zy1:zy1+fence_h,  rx1:rx2].reshape(-1, 3)
+        fence_pixels = np.vstack([fence_left, fence_right])
+
+        results = {}
+        log     = []
+
+        # ── Fit grass ─────────────────────────────────────────────────────────
+        g_ok, g_lo, g_hi, g_msg = self._fit(grass_pixels, "grass",
+            h_range=(25, 100), s_min=30, v_min=40,
+            label="green/olive")
+        if g_ok:
+            results["grass_lo"] = g_lo
+            results["grass_hi"] = g_hi
+        log.append(("GRASS", g_ok, g_msg))
+
+        # ── Fit path ──────────────────────────────────────────────────────────
+        p_ok, p_lo, p_hi, p_msg = self._fit(path_pixels, "path",
+            h_range=(5, 40), s_min=30, v_min=60,
+            label="brown/tan",
+            s_hi_cap=190)   # cap S max so fence doesn't bleed in
+        if p_ok:
+            results["path_lo"] = p_lo
+            results["path_hi"] = p_hi
+        log.append(("PATH", p_ok, p_msg))
+
+        # ── Fit fence (only if bright near-white pixels found) ───────────────
+        # Fence is near-white so filter for high-V, low-S pixels first
+        bright_mask = (fence_pixels[:, 1] < 80) & (fence_pixels[:, 2] > 140)
+        fence_bright = fence_pixels[bright_mask]
+        if len(fence_bright) > 50:
+            f_ok, f_lo, f_hi, f_msg = self._fit(fence_bright, "fence",
+                h_range=(0, 60), s_min=0, v_min=130,
+                label="cream/white",
+                s_hi_cap=70)
+            if f_ok:
+                # Fence: keep S max LOW (it's the key separator from path)
+                f_hi[1] = min(f_hi[1], 70)
+                results["fence_lo"] = f_lo
+                results["fence_hi"] = f_hi
+            log.append(("FENCE", f_ok, f_msg))
+        else:
+            log.append(("FENCE", False,
+                "No bright near-white pixels found in danger zones. "
+                "Try calibrating when fence posts are visible."))
+
+        return results, log
+
+    def _fit(self, pixels, name, h_range, s_min, v_min,
+             label="", s_hi_cap=255):
+        """
+        Filter pixels to expected hue range, then fit min/max ± tolerance.
+        Returns (success, lo_array, hi_array, message).
+        """
+        if len(pixels) == 0:
+            return False, None, None, "No pixels sampled"
+
+        # Filter to plausible hue range for this element
+        h_arr = pixels[:, 0].astype(int)
+        s_arr = pixels[:, 1].astype(int)
+        v_arr = pixels[:, 2].astype(int)
+
+        mask = (
+            (h_arr >= h_range[0]) & (h_arr <= h_range[1]) &
+            (s_arr >= s_min) &
+            (v_arr >= v_min)
+        )
+        filt = pixels[mask]
+
+        if len(filt) < 30:
+            return False, None, None, (
+                f"Only {len(filt)} matching pixels — "
+                f"expected {label} but this region looks wrong. "
+                "Is the game paused or showing menus?"
+            )
+
+        # Use percentile-based fitting to ignore outliers
+        h_med = int(np.percentile(filt[:, 0], 50))
+        s_med = int(np.percentile(filt[:, 1], 50))
+        v_med = int(np.percentile(filt[:, 2], 50))
+
+        # 10th/90th percentile for the actual range, then add tolerance
+        h_lo = max(0,   int(np.percentile(filt[:,0], 10)) - self.H_TOL)
+        h_hi = min(179, int(np.percentile(filt[:,0], 90)) + self.H_TOL)
+        s_lo = max(0,   int(np.percentile(filt[:,1], 10)) - self.S_TOL)
+        s_hi = min(255, int(np.percentile(filt[:,1], 90)) + self.S_TOL)
+        v_lo = max(0,   int(np.percentile(filt[:,2], 10)) - self.V_TOL)
+        v_hi = min(255, int(np.percentile(filt[:,2], 90)) + self.V_TOL)
+
+        # Apply caps
+        s_hi = min(s_hi, s_hi_cap)
+
+        lo = [h_lo, s_lo, v_lo]
+        hi = [h_hi, s_hi, v_hi]
+
+        msg = (f"Median HSV=({h_med},{s_med},{v_med})  "
+               f"Range H:{h_lo}-{h_hi} S:{s_lo}-{s_hi} V:{v_lo}-{v_hi}  "
+               f"from {len(filt)} pixels")
+        return True, lo, hi, msg
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ADAPTIVE TUNER
+#  Watches bot performance in real-time and nudges settings automatically.
+#
+#  What it tracks every 60-frame window:
+#    - turn_rate:   how often the bot is turning vs going straight
+#      → too high (>40%) = deadband too LOW → raise it (phantom turns)
+#      → too low  (< 5%) = deadband too HIGH → lower it (missing turns)
+#    - zigzag_rate: how often direction flips L→R→L in 3 frames
+#      → high = noisy signal, raise deadband or vote_confirm
+#    - death_rate:  game-over events per minute
+#      → rising fast = something is very wrong, try lowering fence threshold
+#    - fence_trigger_rate: how often fence dodge fires
+#      → very high = false positives, raise fence_colour_frac
+#      → zero while dying = not catching fences, lower fence_colour_frac
+#
+#  Adjustments are small and logged so you can see what it changed.
+#  You can disable adaptive tuning from the menu.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AdaptiveTuner:
+    WINDOW     = 60     # frames per evaluation window
+    MAX_NUDGE  = 3      # max adjustments per window (prevents wild swings)
+
+    # How aggressively to nudge — fraction of current value
+    DEADBAND_STEP   = 0.01   # 1 percentage point per nudge
+    FENCE_FRAC_STEP = 0.005
+
+    # Thresholds that trigger nudges
+    TURN_RATE_HIGH  = 0.40   # >40% turns = too sensitive
+    TURN_RATE_LOW   = 0.04   # <4%  turns = too sluggish
+    ZIGZAG_HIGH     = 0.15   # >15% zigzags = noisy
+    FENCE_HIGH      = 0.25   # >25% fence triggers = likely false positives
+    FENCE_LOW_DEATH = 0.02   # <2% fence but dying = missing fences
+
+    def __init__(self, enabled=True):
+        self.enabled       = enabled
+        self._actions      = deque(maxlen=self.WINDOW)
+        self._fence_events = deque(maxlen=self.WINDOW)
+        self._deaths       = deque(maxlen=10)
+        self._nudge_count  = 0
+        self._window_count = 0
+        self.log           = deque(maxlen=50)   # last 50 tuning decisions
+        self._last_eval    = 0
+
+    def record(self, action, fence_triggered, is_death):
+        """Call once per frame with the bot's decision."""
+        if not self.enabled:
+            return
+        self._actions.append(action)
+        self._fence_events.append(1 if fence_triggered else 0)
+        if is_death:
+            self._deaths.append(time.time())
+
+        self._window_count += 1
+        if self._window_count >= self.WINDOW:
+            self._window_count = 0
+            self._nudge_count  = 0
+            self._evaluate()
+
+    def _evaluate(self):
+        """Analyse the window and apply nudges."""
+        n = len(self._actions)
+        if n < 20:
+            return
+
+        actions_list = list(self._actions)
+
+        # ── Turn rate ─────────────────────────────────────────────────────────
+        turns = sum(1 for a in actions_list if a in ("LEFT","RIGHT"))
+        turn_rate = turns / n
+
+        # ── Zigzag rate: L→R or R→L within 3 consecutive frames ──────────────
+        zigzags = 0
+        for i in range(2, len(actions_list)):
+            a, b, c = actions_list[i-2], actions_list[i-1], actions_list[i]
+            if ((a == "LEFT"  and c == "RIGHT") or
+                (a == "RIGHT" and c == "LEFT")) and b in ("LEFT","RIGHT"):
+                zigzags += 1
+        zigzag_rate = zigzags / max(n - 2, 1)
+
+        # ── Fence trigger rate ────────────────────────────────────────────────
+        fence_rate = sum(self._fence_events) / max(len(self._fence_events), 1)
+
+        # ── Recent deaths (last 2 minutes) ────────────────────────────────────
+        now = time.time()
+        recent_deaths = sum(1 for t in self._deaths if now - t < 120)
+
+        nudges = []
+
+        # ── Apply nudges ──────────────────────────────────────────────────────
+
+        # 1. Too many phantom turns / zigzagging → raise deadband
+        if turn_rate > self.TURN_RATE_HIGH and self._nudge_count < self.MAX_NUDGE:
+            old = CFG["grass_deadband"]
+            CFG["grass_deadband"] = min(0.40, old + self.DEADBAND_STEP)
+            nudges.append(f"turn_rate={turn_rate:.0%} HIGH → grass_deadband "
+                          f"{old:.2f}→{CFG['grass_deadband']:.2f}")
+            self._nudge_count += 1
+
+        if zigzag_rate > self.ZIGZAG_HIGH and self._nudge_count < self.MAX_NUDGE:
+            old = CFG["grass_deadband"]
+            CFG["grass_deadband"] = min(0.40, old + self.DEADBAND_STEP)
+            nudges.append(f"zigzag={zigzag_rate:.0%} HIGH → grass_deadband "
+                          f"{old:.2f}→{CFG['grass_deadband']:.2f}")
+            self._nudge_count += 1
+            # Also raise vote_confirm if still low
+            if CFG["vote_confirm"] < 2:
+                CFG["vote_confirm"] = 2
+                nudges.append("zigzag HIGH → vote_confirm 1→2")
+
+        # 2. Barely turning at all → lower deadband
+        if (turn_rate < self.TURN_RATE_LOW and
+                CFG["grass_deadband"] > 0.06 and
+                self._nudge_count < self.MAX_NUDGE):
+            old = CFG["grass_deadband"]
+            CFG["grass_deadband"] = max(0.06, old - self.DEADBAND_STEP)
+            nudges.append(f"turn_rate={turn_rate:.0%} LOW → grass_deadband "
+                          f"{old:.2f}→{CFG['grass_deadband']:.2f}")
+            self._nudge_count += 1
+
+        # 3. Too many fence triggers (likely false positives) → raise threshold
+        if fence_rate > self.FENCE_HIGH and self._nudge_count < self.MAX_NUDGE:
+            old = CFG["fence_colour_frac"]
+            CFG["fence_colour_frac"] = min(0.25, old + self.FENCE_FRAC_STEP)
+            nudges.append(f"fence_rate={fence_rate:.0%} HIGH → fence_colour_frac "
+                          f"{old:.3f}→{CFG['fence_colour_frac']:.3f}")
+            self._nudge_count += 1
+
+        # 4. Dying repeatedly but fence barely triggering → lower threshold
+        if (recent_deaths >= 3 and
+                fence_rate < self.FENCE_LOW_DEATH and
+                CFG["fence_colour_frac"] > 0.02 and
+                self._nudge_count < self.MAX_NUDGE):
+            old = CFG["fence_colour_frac"]
+            CFG["fence_colour_frac"] = max(0.02, old - self.FENCE_FRAC_STEP)
+            nudges.append(f"deaths={recent_deaths} + fence_rate low → fence_colour_frac "
+                          f"{old:.3f}→{CFG['fence_colour_frac']:.3f}")
+            self._nudge_count += 1
+
+        # ── Log results ───────────────────────────────────────────────────────
+        summary = (f"[ADAPT] turns={turn_rate:.0%} zigzag={zigzag_rate:.0%} "
+                   f"fence={fence_rate:.0%} deaths={recent_deaths}")
+        if nudges:
+            for n_msg in nudges:
+                entry = f"{summary} | nudge: {n_msg}"
+                self.log.append(entry)
+                print(f"\n  🔧 {entry}")
+            save_settings(CFG)   # persist the auto-nudges
+        else:
+            self.log.append(summary + " | no change")
+
+    def show_log(self):
+        if not self.log:
+            print("  No adaptive tuning events yet.")
+            return
+        print(f"\n  Last {len(self.log)} adaptive tuning events:")
+        for entry in self.log:
+            print(f"    {entry}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  VISUAL DUMP
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -795,8 +1108,10 @@ def save_visual_dump(frame, path="bbot_debug.jpg"):
 
 class BunnyBot:
     def __init__(self):
-        self.dm     = DeviceManager()
-        self.vision = Vision()
+        self.dm      = DeviceManager()
+        self.vision  = Vision()
+        self.tuner   = AdaptiveTuner(enabled=CFG.get("adaptive_tuning", True))
+        self.calibr  = AutoCalibrator()
         self._reset_state()
 
     def _reset_state(self):
@@ -857,6 +1172,9 @@ class BunnyBot:
         self.screen_w, self.screen_h = frame.shape[1], frame.shape[0]
 
         action, dbg = self.vision.decide(frame)
+        is_death        = (action == "RESTART")
+        fence_triggered = bool(dbg.get("sigs_L", 0) or dbg.get("sigs_R", 0))
+        self.tuner.record(action, fence_triggered, is_death)
         self._execute(action, self.screen_w, self.screen_h)
 
         if CFG["debug"]:
@@ -950,15 +1268,16 @@ def show_status(bot):
     fps   = CFG['loop_fps']
     cool  = CFG['action_cooldown']
     dbg   = "ON" if CFG["debug"] else "OFF"
+    adapt = "ON ✓" if CFG.get("adaptive_tuning", True) else "OFF"
 
     _top()
-    _line("🐰  BunnyBot v6 — Bunny Runner 3D")
+    _line("🐰  BunnyBot v7 — Bunny Runner 3D")
     _line("Settings auto-save on every change • Delete bunnybot_settings.json to full reset")
     _sep()
     _line(f"Device      : {dev}")
     _line(f"Backend     : {bknd}   │  adbutils: {au}")
     _line(f"Night light : {nl}   │  FPS: {fps}   │  Cooldown: {cool}s   │  Debug: {dbg}")
-    _line(f"Settings    : {saved}")
+    _line(f"Adaptive    : {adapt}   │  Settings: {saved}")
     _divider()
 
 
@@ -966,16 +1285,19 @@ def show_main_menu(bot):
     show_status(bot)
     _line("MAIN MENU — choose a category or action")
     _sep()
-    _line("  C   ► Colour Tuning          (grass, path, fence, night light)")
-    _line("  T   ► Timing & Speed         (FPS, cooldown, reaction speed)")
-    _line("  R   ► Reaction Sensitivity   (turn sharpness, fence strictness)")
-    _line("  Z   ► Zone Positions         (lookahead, danger zones, tap spots)")
-    _line("  D   ► Device & Connection    (ADB, backend, screencap method)")
-    _line("  X   ► Reset Options          (reset specific groups or factory reset)")
+    _line("  A   ► AUTO CALIBRATE ★        (auto-detect colours from screenshot!)")
+    _line("  K   ► Adaptive Self-Tuning    (bot adjusts itself while running)")
     _sep()
-    _line("  V   ► Visual Dump            (see what the bot sees — do this first!)")
-    _line("  0   ► Full Diagnostics       (test ADB connection + screencap)")
-    _line("  S   ► START BOT              (launches the bot)")
+    _line("  C   ► Colour Tuning           (manual: grass, path, fence, night light)")
+    _line("  T   ► Timing & Speed          (FPS, cooldown, reaction speed)")
+    _line("  R   ► Reaction Sensitivity    (turn sharpness, fence strictness)")
+    _line("  Z   ► Zone Positions          (lookahead, danger zones, tap spots)")
+    _line("  D   ► Device & Connection     (ADB, backend, screencap method)")
+    _line("  X   ► Reset Options           (reset specific groups or factory reset)")
+    _sep()
+    _line("  V   ► Visual Dump             (see what the bot sees — do this first!)")
+    _line("  0   ► Full Diagnostics        (test ADB connection + screencap)")
+    _line("  S   ► START BOT               (launches the bot)")
     _line("  Q   ► Quit")
     _bot()
 
@@ -1541,6 +1863,169 @@ def menu_reset():
             print("  Unknown option.")
 
 
+def menu_autocal(bot):
+    """Auto-calibration menu — samples live screenshot to set colour ranges."""
+    _top()
+    _line("AUTO CALIBRATION")
+    _line("The bot will take a screenshot and analyse your game's actual colours.")
+    _line("For best results:")
+    _line("  • Be IN the game, actively running (not paused/menus)")
+    _line("  • Make sure you can see grass on BOTH sides of the path")
+    _line("  • Night light ON? Turn it on before calibrating")
+    _sep()
+    _line("  1   ► Run auto-calibration now")
+    _line("  2   ► Run calibration + apply if all colours found")
+    _line("  V   ► Visual dump after calibration (to verify)")
+    _line("  B   ► Back")
+    _bot()
+
+    while True:
+        c = input("  Option: ").strip().lower()
+        if c == "b":
+            return
+
+        elif c in ("1", "2"):
+            if not bot.dm.backend:
+                if not bot.dm.setup():
+                    print("  Fix connection first.")
+                    continue
+
+            print("\n  📸 Capturing screenshot…")
+            frame = bot.dm.screencap()
+            if frame is None:
+                print("  ✗ Screenshot failed. Go to Device → Full Diagnostics.")
+                continue
+
+            print("  🔬 Analysing colours…\n")
+            results, log = bot.calibr.calibrate(frame)
+
+            # Show what was found
+            print("  ┌─ Calibration Results ─────────────────────────────────┐")
+            all_ok = True
+            for element, ok, msg in log:
+                status = "✓" if ok else "✗"
+                print(f"  │  {status} {element:<6} {msg}")
+                if not ok:
+                    all_ok = False
+            print("  └───────────────────────────────────────────────────────┘")
+
+            if not results:
+                print("\n  ✗ No colours could be detected.")
+                print("    Make sure the game is running and the path/grass is visible.")
+                continue
+
+            # Show proposed changes
+            print("\n  Proposed changes:")
+            for key, val in results.items():
+                old = CFG.get(key, "?")
+                print(f"    {key:<12} : {old}  →  {val}")
+
+            if c == "2" or (c == "1" and all_ok):
+                if not all_ok:
+                    ans = input("\n  Some elements not found. Apply partial results? [y/N]: ").strip().lower()
+                    if ans != "y":
+                        print("  Cancelled.")
+                        continue
+
+                # Apply results
+                for key, val in results.items():
+                    CFG[key] = val
+
+                # Reset night light shift since we recalibrated
+                CFG["night_light_shift"] = 0
+
+                _autosave()
+                print("\n  ✅ Colour ranges updated and saved!")
+                print("  Press V to run a visual dump and verify the colours look correct.")
+
+            elif c == "1":
+                ans = input("\n  Apply these changes? [y/N]: ").strip().lower()
+                if ans == "y":
+                    for key, val in results.items():
+                        CFG[key] = val
+                    CFG["night_light_shift"] = 0
+                    _autosave()
+                    print("  ✅ Applied and saved!")
+                else:
+                    print("  Not applied.")
+
+        elif c == "v":
+            _do_visual_dump(bot)
+
+        else:
+            print("  Unknown option.")
+
+
+def menu_adaptive(bot):
+    """Adaptive tuner settings and log viewer."""
+    while True:
+        enabled = bot.tuner.enabled
+        _top()
+        _line("ADAPTIVE SELF-TUNING")
+        _line("Watches the bot's performance and auto-adjusts settings every 60 frames.")
+        _sep()
+        _line("WHAT IT ADJUSTS:")
+        _line("  • Grass deadband  — turns too often/rarely?")
+        _line("    Too many phantom turns → raises deadband (less sensitive)")
+        _line("    Never turning         → lowers deadband (more sensitive)")
+        _line("  • Vote confirm    — zigzagging back and forth?")
+        _line("    Raises to 2 if zigzag rate is too high")
+        _line("  • Fence threshold — missing or falsely dodging fences?")
+        _line("    Deaths + low fence triggers → lowers threshold")
+        _line("    Too many fence triggers     → raises threshold")
+        _sep()
+        _line(f"  1   ► Toggle adaptive tuning   current: {'ENABLED ✓' if enabled else 'DISABLED ✗'}")
+        _line(f"  2   ► View tuning log          ({len(bot.tuner.log)} events recorded)")
+        _line(f"  3   ► Reset tuner memory       (clears performance history)")
+        _sep()
+        _line("TUNING AGGRESSIVENESS (how fast it nudges):")
+        _line(f"  4   ► Deadband step size       current: {bot.tuner.DEADBAND_STEP*100:.1f}% per nudge")
+        _line("        Smaller = slower/gentler   Larger = faster but risky")
+        _line(f"  5   ► Max nudges per window     current: {bot.tuner.MAX_NUDGE}")
+        _line("        Higher = adapts faster   Lower = more conservative")
+        _sep()
+        _line("  B   ► Back")
+        _bot()
+
+        c = input("  Option: ").strip().lower()
+        if c == "b": break
+
+        elif c == "1":
+            bot.tuner.enabled = not bot.tuner.enabled
+            CFG["adaptive_tuning"] = bot.tuner.enabled
+            state = "ENABLED" if bot.tuner.enabled else "DISABLED"
+            print(f"  ✓ Adaptive tuning → {state}")
+            _autosave()
+
+        elif c == "2":
+            bot.tuner.show_log()
+
+        elif c == "3":
+            bot.tuner._actions.clear()
+            bot.tuner._fence_events.clear()
+            bot.tuner._deaths.clear()
+            bot.tuner.log.clear()
+            bot.tuner._window_count = 0
+            print("  ✓ Tuner memory cleared.")
+
+        elif c == "4":
+            try:
+                v = float(input(f"  Step size % [current {bot.tuner.DEADBAND_STEP*100:.1f}]: "))
+                bot.tuner.DEADBAND_STEP = max(0.005, min(0.05, v/100))
+                print(f"  ✓ Deadband step → {bot.tuner.DEADBAND_STEP*100:.1f}%")
+            except ValueError: print("  Invalid.")
+
+        elif c == "5":
+            try:
+                v = int(input(f"  Max nudges per window [current {bot.tuner.MAX_NUDGE}]: "))
+                bot.tuner.MAX_NUDGE = max(1, min(10, v))
+                print(f"  ✓ Max nudges → {bot.tuner.MAX_NUDGE}")
+            except ValueError: print("  Invalid.")
+
+        else:
+            print("  Unknown option.")
+
+
 # ─────────────────── HELPERS ───────────────────
 
 def _autosave():
@@ -1574,7 +2059,7 @@ def apply_night_light_shift(amount: int):
 
 BANNER = """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   🐰  BunnyBot v6 — Bunny Runner 3D                                ║
+║   🐰  BunnyBot v7 — Bunny Runner 3D                                ║
 ║   Persistent Settings • Guided Tuning • Granular Controls          ║
 ╚══════════════════════════════════════════════════════════════════════╝"""
 
@@ -1593,7 +2078,13 @@ def menu():
         show_main_menu(bot)
         c = input("  Option: ").strip().lower()
 
-        if c == "c":
+        if c == "a":
+            menu_autocal(bot)
+
+        elif c == "k":
+            menu_adaptive(bot)
+
+        elif c == "c":
             menu_colours(bot)
 
         elif c == "t":
