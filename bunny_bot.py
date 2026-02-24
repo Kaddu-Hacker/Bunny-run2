@@ -1,73 +1,45 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════╗
-║      🐰  BunnyBot v5 — Bunny Runner 3D                         ║
-║      Colour-accurate  •  Night-light aware  •  Multi-signal    ║
-╚══════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════╗
+║   🐰  BunnyBot v6 — Bunny Runner 3D                                ║
+║   Persistent Settings  •  Guided Tuning  •  Granular Controls      ║
+╚══════════════════════════════════════════════════════════════════════╝
 
-COLOUR ANALYSIS  (from real game screenshots)
-──────────────────────────────────────────────
-  Measured in OpenCV HSV (H: 0-179, S: 0-255, V: 0-255)
+HOW THE BOT WORKS (read this once!)
+─────────────────────────────────────
+  Every 1/FPS seconds the bot:
+    1. Takes a screenshot of your phone via ADB
+    2. Converts it to HSV colour space
+    3. Looks at a horizontal "lookahead strip" (middle of screen)
+    4. Counts GREEN (grass) pixels on the LEFT half vs RIGHT half
+       → More grass on LEFT  = path curves RIGHT → tap RIGHT
+       → More grass on RIGHT = path curves LEFT  → tap LEFT
+    5. Also checks LEFT/RIGHT danger zones for CREAM fence posts
+       → Fence on LEFT  = dodge RIGHT
+       → Fence on RIGHT = dodge LEFT
+    6. If game-over screen detected → auto-tap retry
 
-  PATH  (brown dirt)  : H=15,   S=96-130,  V=140-165
-  FENCE (cream posts) : H=15-18, S=5-35,   V=210-240
-  GRASS (olive green) : H=48-51, S=106-121, V=105-120
-  CARROT (orange)     : H=10-15, S=200-255, V=170-220
-  BUNNY (sandy)       : H=20-28, S=40-80,  V=155-200
+COLOUR ANALYSIS (from your screenshots)
+─────────────────────────────────────────
+  HSV scale: H=0-179, S=0-255, V=0-255
 
-  ⚠ CRITICAL INSIGHT: Path and Fence share almost the SAME HUE (~H=15).
-    They can ONLY be separated by SATURATION:
-      PATH  S = 80-150  (medium saturation)
-      FENCE S = 5-40    (very low saturation — nearly white)
-    This is why old code using only hue failed to separate them.
+  GRASS  (olive green) : H=38-90,  S=50-255, V=60-200
+  PATH   (brown dirt)  : H=8-35,   S=50-180, V=100-210
+  FENCE  (cream/white) : H=0-50,   S=0-45,   V=175-255
+  CARROT (orange)      : H=5-20,   S=200-255,V=150-230
 
-  🌙 NIGHT LIGHT MODE shifts colours warmer (+5 to +15 on H),
-    so all ranges are widened to accommodate this.
+  ⚠ Path & Fence share the same HUE (~H=15). Separated ONLY by saturation:
+    PATH  S=80-150 (medium)   FENCE S=5-40 (near-white, very low)
 
-TURN DETECTION STRATEGY
-────────────────────────
-  PRIMARY signal: GRASS pixel balance
-    The grass (H=38-90) is the MOST DISTINCT colour in the game.
-    When the path curves RIGHT, the grass/path boundary moves:
-      → More grass appears on the LEFT side of lookahead strip
-      → Tap RIGHT to follow the path
+  🌙 Night light shifts all H values warmer by +5 to +15
 
-    More grass LEFT  → tap RIGHT
-    More grass RIGHT → tap LEFT
-    Balanced         → straight
-
-  SECONDARY signal: PATH pixel balance (brown pixels L vs R)
-    Backs up the grass signal. Used as tiebreaker.
-
-  BOTH signals must agree (or one must be strong) to act.
-
-FENCE DETECTION STRATEGY
-─────────────────────────
-  Fences = cream/white posts:  S < 45 AND V > 180
-  Three checks per danger zone:
-    1. % of zone that is fence-coloured  (colour mask)
-    2. Sudden vertical edge density spike (Canny edges)
-    3. Horizontal scan: are multiple fence-shaped blobs present?
-  Any 1 of 3 triggers a dodge.
-
-BACKENDS
-─────────
-  auto     → tries adbutils first, falls back to ADB subprocess
-  adbutils → pip install adbutils --break-system-packages
-  adb      → pkg install android-tools -y
-
-QUICK START
-───────────
-  pkg install python android-tools python-numpy opencv-python -y
-  pip install adbutils --break-system-packages
-  adb pair <IP>:<PAIR_PORT>
-  adb connect <IP>:<CONN_PORT>
-  python bunny_bot.py
-  → press V (visual dump to check colours) → S (start)
+SETTINGS ARE SAVED to bunnybot_settings.json automatically.
+Delete that file to fully reset to factory defaults.
 """
 
-import os, sys, time, subprocess, traceback
+import os, sys, time, subprocess, traceback, json
 from collections import deque
+from pathlib import Path
 
 try:
     import cv2
@@ -83,125 +55,162 @@ try:
 except ImportError:
     ADBUTILS_OK = False
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETTINGS PERSISTENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SETTINGS_FILE = Path("bunnybot_settings.json")
+
+# All keys that get saved to disk (internal/runtime keys excluded)
+SAVEABLE_KEYS = {
+    "device", "backend", "screencap_method", "game_package",
+    "loop_fps", "startup_delay", "action_cooldown",
+    "tap_left_x", "tap_right_x", "tap_y",
+    "la_top", "la_bottom",
+    "dz_left_x", "dz_right_x", "dz_y",
+    "gameover_y", "gameover_x",
+    "grass_lo", "grass_hi",
+    "path_lo",  "path_hi",
+    "fence_lo", "fence_hi",
+    "grass_min_px", "grass_deadband", "path_deadband",
+    "fence_colour_frac", "canny_lo", "canny_hi",
+    "fence_edge_ratio", "fence_min_signals",
+    "gameover_dark_frac", "gameover_dark_v_max", "gameover_bright_px",
+    "vote_confirm", "debug", "debug_save_frames",
+    "night_light_shift",
+}
+
+def save_settings(cfg):
+    data = {}
+    for k in SAVEABLE_KEYS:
+        if k in cfg:
+            v = cfg[k]
+            # tuples → list for JSON
+            if isinstance(v, tuple):
+                v = list(v)
+            data[k] = v
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"  ⚠ Could not save: {e}")
+        return False
+
+def load_settings(cfg):
+    if not SETTINGS_FILE.exists():
+        return False
+    try:
+        with open(SETTINGS_FILE) as f:
+            data = json.load(f)
+        count = 0
+        for k, v in data.items():
+            if k in SAVEABLE_KEYS and k in cfg:
+                # restore tuples that are stored as lists
+                if isinstance(cfg[k], tuple) and isinstance(v, list):
+                    cfg[k] = tuple(v)
+                else:
+                    cfg[k] = v
+                count += 1
+        return count
+    except Exception as e:
+        print(f"  ⚠ Could not load settings: {e}")
+        return False
+
+def reset_one(cfg, defaults, key):
+    """Reset a single key to factory default."""
+    if key in defaults:
+        cfg[key] = defaults[key]
+        return True
+    return False
+
+def reset_group(cfg, defaults, keys):
+    """Reset a group of keys."""
+    for k in keys:
+        reset_one(cfg, defaults, k)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIGURATION DEFAULTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CFG = {
-    # ── Device / Backend ─────────────────────────────────────────────────────
-    "device":           "",       # blank = auto-detect; or "192.168.x.x:PORT"
+_DEFAULTS = {
+    # Connection
+    "device":           "",
     "adb_timeout":      12,
-    "backend":          "auto",   # auto | adbutils | adb
-    "screencap_method": "auto",   # auto | exec-out | local | pull
+    "backend":          "auto",
+    "screencap_method": "auto",
+    "game_package":     "com.kwalee.bunnyrunner",
 
-    # ── Game ─────────────────────────────────────────────────────────────────
-    "game_package": "com.kwalee.bunnyrunner",
+    # Timing — affects how fast/responsive the bot is
+    "loop_fps":        10,       # how many frames analysed per second
+    "startup_delay":    4,       # seconds before bot activates after pressing S
+    "action_cooldown": 0.20,     # min gap between taps in seconds
 
-    # ── Timing ───────────────────────────────────────────────────────────────
-    "loop_fps":        10,     # captures per second
-    "startup_delay":    4,     # seconds before bot starts tapping
-    "action_cooldown": 0.20,   # min seconds between taps (prevents spam)
+    # Tap positions (fraction 0.0-1.0 of screen width/height)
+    "tap_left_x":  0.25,         # X position for left tap  (25% from left)
+    "tap_right_x": 0.75,         # X position for right tap (75% from left)
+    "tap_y":       0.65,         # Y position for all taps  (65% from top)
 
-    # ── Tap positions (fraction of screen width/height) ───────────────────────
-    # Left tap  = left quarter of screen
-    # Right tap = right quarter of screen
-    # Tap at 65% height (below centre — where game registers input)
-    "tap_left_x":  0.25,
-    "tap_right_x": 0.75,
-    "tap_y":       0.65,
+    # Lookahead strip — the horizontal band analysed for turn detection
+    "la_top":    0.30,           # strip starts at 30% from top
+    "la_bottom": 0.60,           # strip ends   at 60% from top
 
-    # ── LOOK-AHEAD STRIP ─────────────────────────────────────────────────────
-    # Horizontal band where we measure grass/path balance to detect turns.
-    # Placed at 30-60% height — the middle of the visible track,
-    # far enough ahead to react in time, not so far the turn isn't visible yet.
-    "la_top":    0.30,
-    "la_bottom": 0.60,
+    # Danger zones — areas scanned for incoming fence posts
+    "dz_left_x":  (0.02, 0.44), # left zone:  2% to 44% width
+    "dz_right_x": (0.56, 0.98), # right zone: 56% to 98% width
+    "dz_y":       (0.25, 0.75), # both zones: 25% to 75% height
 
-    # ── DANGER ZONES ─────────────────────────────────────────────────────────
-    # Left and right corridors where fence posts appear before reaching the bunny.
-    # Fence rows run diagonally, so zones cover 25-75% height.
-    "dz_left_x":  (0.02, 0.44),
-    "dz_right_x": (0.56, 0.98),
-    "dz_y":       (0.25, 0.75),
-
-    # ── GAME-OVER ZONE ────────────────────────────────────────────────────────
+    # Game-over zone
     "gameover_y": (0.55, 0.95),
     "gameover_x": (0.20, 0.80),
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # COLOUR RANGES (HSV — OpenCV scale: H 0-179, S 0-255, V 0-255)
-    # Derived from pixel analysis of real game screenshots.
-    # Ranges are widened (+/-10 on H, +/-30 on S/V) to handle:
-    #   • Night light mode  (shifts H warmer by ~10)
-    #   • Different phone screens  (brightness variation)
-    #   • Shadows and lighting in game
-    # ═══════════════════════════════════════════════════════════════════════
+    # Colour ranges [H, S, V] — OpenCV HSV scale
+    "grass_lo": [38,  50,  60],  # olive green (lower bound)
+    "grass_hi": [90, 255, 200],  # olive green (upper bound)
+    "path_lo":  [ 8,  50, 100],  # brown dirt  (lower bound)
+    "path_hi":  [35, 180, 210],  # brown dirt  (upper bound)
+    "fence_lo": [ 0,   0, 175],  # cream white (lower bound)
+    "fence_hi": [50,  45, 255],  # cream white (upper bound)
 
-    # GRASS — olive/yellow-green.
-    # H=38-90 covers the green channel cleanly, far from path/fence.
-    # This is our MOST RELIABLE signal for turn detection.
-    "grass_lo": [38,  50,  60],
-    "grass_hi": [90, 255, 200],
+    # Turn detection sensitivity
+    "grass_min_px":   200,       # minimum grass pixels before trusting signal
+    "grass_deadband": 0.12,      # imbalance needed to trigger turn (12%)
+    "path_deadband":  0.10,      # same for path signal (backup)
 
-    # PATH — warm brown/tan dirt.
-    # Key: S must be > 50 to exclude fence posts (which have S < 40).
-    # Key: S must be < 180 to exclude carrots (S > 180).
-    "path_lo": [ 8,  50, 100],
-    "path_hi": [35, 180, 210],
+    # Fence detection sensitivity
+    "fence_colour_frac": 0.05,   # 5% of zone must be fence colour
+    "canny_lo":          35,     # edge detection lower threshold
+    "canny_hi":          110,    # edge detection upper threshold
+    "fence_edge_ratio":  1.6,    # how much denser zone edges vs background
+    "fence_min_signals": 1,      # how many signals (1=sensitive, 2=strict)
 
-    # FENCE POSTS — cream/near-white.
-    # Key separator: very LOW saturation (S < 45) + HIGH value (V > 175).
-    # Path has S=80-130, so S < 45 uniquely identifies fence posts.
-    # H range is wide because near-white pixels can shift hue easily.
-    "fence_lo": [ 0,   0, 175],
-    "fence_hi": [50,  45, 255],
-
-    # ── Turn detection thresholds ─────────────────────────────────────────
-    # Minimum grass pixels in strip before we trust the grass signal.
-    # Prevents acting on pure-path screens (e.g. beginning of game).
-    "grass_min_px":   200,
-
-    # How lopsided the grass must be before we turn.
-    # 0.12 = 12 percentage-points more grass on one side than the other.
-    # Lower = more sensitive (reacts to small curves); raise if too jittery.
-    "grass_deadband": 0.12,
-
-    # Path signal deadband (used as tiebreaker / confirmation).
-    "path_deadband":  0.10,
-
-    # ── Fence detection thresholds ────────────────────────────────────────
-    # Fraction of danger zone that must be fence-coloured to trigger dodge.
-    # 0.05 = 5% — low threshold because fence posts are thin.
-    "fence_colour_frac": 0.05,
-
-    # Canny edge thresholds for edge density detection
-    "canny_lo": 35,
-    "canny_hi": 110,
-
-    # How many times denser the danger zone edges must be vs background.
-    "fence_edge_ratio": 1.6,
-
-    # Number of fence signals (out of 2) needed to trigger a dodge.
-    # 1 = more sensitive (catches more fences, some false positives)
-    # 2 = more conservative (fewer false positives, may miss some)
-    "fence_min_signals": 1,
-
-    # ── Game-over detection ───────────────────────────────────────────────
+    # Game-over detection
     "gameover_dark_frac":  0.48,
     "gameover_dark_v_max": 68,
     "gameover_bright_px":  280,
 
-    # ── Smoothing ─────────────────────────────────────────────────────────
-    # How many CONSECUTIVE frames must agree on a direction before acting.
-    # 1 = react on every frame (fastest, can be noisy)
-    # 2 = two frames must agree (smoother, 100ms lag at 10fps)
-    "vote_confirm": 1,
+    # Smoothing
+    "vote_confirm": 1,           # frames that must agree before acting
 
-    # ── Debug ─────────────────────────────────────────────────────────────
-    "debug":             False,   # print per-frame decisions
-    "debug_save_frames": False,   # save annotated frames to ./debug_frames/
+    # Debug
+    "debug":             False,
+    "debug_save_frames": False,
+
+    # Night light tracking
+    "night_light_shift": 0,      # cumulative H shift applied so far
 }
+
+# Working config — copy of defaults, then overridden by saved file
+CFG = dict(_DEFAULTS)
+for k, v in _DEFAULTS.items():
+    if isinstance(v, list):
+        CFG[k] = list(v)
+    elif isinstance(v, tuple):
+        CFG[k] = tuple(v)
+    else:
+        CFG[k] = v
+
+_loaded = load_settings(CFG)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -209,7 +218,6 @@ CFG = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ADBSubprocessBackend:
-    """Drives the adb command-line binary via subprocess."""
     name = "adb-subprocess"
 
     def __init__(self, device=""):
@@ -261,14 +269,12 @@ class ADBSubprocessBackend:
                            capture_output=True, timeout=8)
             time.sleep(1.0)
 
-    # ── Three screencap methods with auto-fallback ────────────────────────────
     def screencap(self):
         order = {
             "exec-out": self._cap_exec_out,
             "local":    self._cap_local_tmp,
             "pull":     self._cap_sdcard,
         }
-        # Try current method first, then the others
         methods = [self._cap_method] + [m for m in order if m != self._cap_method]
         for method in methods:
             fn  = order.get(method, self._cap_local_tmp)
@@ -317,9 +323,7 @@ class ADBSubprocessBackend:
             print(f"\n  → Using: {chosen}")
             return True
         print("\n  ✗ All screencap methods failed.")
-        print("    Fix: adb kill-server && adb connect <IP>:<PORT>")
-        print("    Or:  phone → Developer Options → Revoke USB debugging → reconnect")
-        print("    Or:  switch to adbutils backend (menu → B → adbutils)")
+        print("    adb kill-server && adb connect <IP>:<PORT>")
         return False
 
     def tap(self, x, y):
@@ -338,7 +342,6 @@ class ADBSubprocessBackend:
 
 
 class AdbUtilsBackend:
-    """Pure-Python ADB via socket. Install: pip install adbutils --break-system-packages"""
     name = "adbutils"
 
     def __init__(self, device=""):
@@ -389,7 +392,7 @@ class AdbUtilsBackend:
                 return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
             if arr.shape[2] == 4:
                 return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-            return arr[:, :, ::-1].copy()   # RGB → BGR
+            return arr[:, :, ::-1].copy()
         except Exception as e:
             print(f"[adbutils] screencap: {e}")
             return None
@@ -418,7 +421,6 @@ class AdbUtilsBackend:
 
 
 def _decode_png(data: bytes):
-    """Decode raw PNG bytes from adb — handles CRLF corruption."""
     clean = data.replace(b"\r\n", b"\n")
     buf   = np.frombuffer(clean, dtype=np.uint8)
     img   = cv2.imdecode(buf, cv2.IMREAD_COLOR)
@@ -427,7 +429,7 @@ def _decode_png(data: bytes):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DEVICE MANAGER  (backend selection + unified API)
+#  DEVICE MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DeviceManager:
@@ -444,7 +446,6 @@ class DeviceManager:
         print(f"\n[BOT] Backend mode: {mode}")
         if mode == "adbutils":  return self._init_adbutils()
         if mode == "adb":       return self._init_adb()
-        # auto
         if ADBUTILS_OK:
             print("[BOT] Trying adbutils first…")
             if self._init_adbutils(silent=True):
@@ -452,7 +453,6 @@ class DeviceManager:
             print("[BOT] adbutils unavailable → falling back to ADB subprocess")
         else:
             print("[BOT] adbutils not installed → using ADB subprocess")
-            print("  Tip: pip install adbutils --break-system-packages  (often more reliable)")
         return self._init_adb()
 
     def _init_adbutils(self, silent=False):
@@ -485,10 +485,9 @@ class DeviceManager:
         return True
 
     def run_diagnostics(self):
-        print("\n" + "═"*52)
+        print("\n" + "═"*56)
         print("  BACKEND DIAGNOSTICS")
-        print("═"*52)
-
+        print("═"*56)
         print("\n▶ adbutils (pure Python — recommended)")
         if not ADBUTILS_OK:
             print("  ✗ Not installed")
@@ -503,7 +502,6 @@ class DeviceManager:
                     print("  ✗ Connected but screencap returned None")
             else:
                 print("  ✗ No device found")
-
         print("\n▶ ADB subprocess")
         b2 = self._adb
         if not CFG["device"]: b2.auto_connect()
@@ -512,13 +510,8 @@ class DeviceManager:
         else:
             print(f"  Device: {b2.device}")
             b2.test_all_methods()
+        print("\n" + "═"*56 + "\n")
 
-        print("\n" + "═"*52)
-        print("  If adbutils works → use it (menu B → adbutils)")
-        print("  If only ADB works → set screencap method (menu 9)")
-        print("═"*52 + "\n")
-
-    # ── Unified API ───────────────────────────────────────────────────────────
     def screencap(self): return self.backend.screencap() if self.backend else None
     def tap(self, x, y):
         if self.backend: self.backend.tap(x, y)
@@ -554,52 +547,20 @@ def _conn_help():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Vision:
-    """
-    TURN DETECTION
-    ──────────────
-    Signal A (PRIMARY): GRASS balance
-      Count green (H=38-90) pixels in left vs right half of look-ahead strip.
-      More grass LEFT  → path curving RIGHT → tap RIGHT
-      More grass RIGHT → path curving LEFT  → tap LEFT
-
-    Signal B (SECONDARY): PATH balance
-      Count brown/dirt pixels left vs right.
-      More path RIGHT → tap RIGHT, more path LEFT → tap LEFT
-
-    Decision: if both signals agree → act immediately.
-              if only one fires → act if it's strong enough.
-              if neither → STRAIGHT.
-
-    FENCE DETECTION
-    ───────────────
-    Two signals per danger zone:
-      1. Colour: fraction of zone with fence-colour pixels (cream, S<45, V>175)
-      2. Edges:  sudden spike in Canny edge density vs background strip
-
-    fence_min_signals controls how many must fire (default=1 for sensitivity).
-    Fence on LEFT  → tap RIGHT to dodge
-    Fence on RIGHT → tap LEFT to dodge
-    """
-
     def __init__(self):
         self._vote_buf = deque(maxlen=3)
         self._frame_n  = 0
 
-    # ── Main entry ────────────────────────────────────────────────────────────
-
     def decide(self, frame):
-        """Returns (action: str, debug_dict: dict)"""
         self._frame_n += 1
         h, w = frame.shape[:2]
         dbg  = {"frame": self._frame_n, "w": w, "h": h}
 
-        # Priority 1: Game over?
         if self._is_game_over(frame, w, h):
             self._vote_buf.clear()
             dbg["reason"] = "GAME_OVER"
             return "RESTART", dbg
 
-        # Priority 2: Fence dodge
         fence_action, fdebug = self._detect_fences(frame, w, h)
         dbg.update(fdebug)
         if fence_action:
@@ -607,11 +568,9 @@ class Vision:
             dbg["reason"] = f"FENCE → {fence_action}"
             return fence_action, dbg
 
-        # Priority 3: Turn detection
         raw, tdebug = self._detect_turn(frame, w, h)
         dbg.update(tdebug)
 
-        # Smooth with vote buffer
         self._vote_buf.append(raw)
         n = len(self._vote_buf)
         needed = CFG["vote_confirm"]
@@ -620,10 +579,8 @@ class Vision:
         else:
             action = "STRAIGHT"
 
-        dbg["reason"] = f"TURN → {raw}" + ("" if action == raw else " (confirming…)")
+        dbg["reason"] = f"TURN → {raw}" + ("" if action == raw else " (wait…)")
         return action, dbg
-
-    # ── Game-over detection ───────────────────────────────────────────────────
 
     def _is_game_over(self, frame, w, h):
         v = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 2]
@@ -635,12 +592,9 @@ class Vision:
         bright = np.count_nonzero(v[gy1:gy2, gx1:gx2] > 200)
         return int(bright) > CFG["gameover_bright_px"]
 
-    # ── Turn detection ────────────────────────────────────────────────────────
-
     def _detect_turn(self, frame, w, h):
-        """Combine grass balance + path balance to determine turn direction."""
-        y1 = int(CFG["la_top"]    * h)
-        y2 = int(CFG["la_bottom"] * h)
+        y1  = int(CFG["la_top"]    * h)
+        y2  = int(CFG["la_bottom"] * h)
         mid = w // 2
 
         strip     = frame[y1:y2, :]
@@ -654,27 +608,25 @@ class Vision:
         grass_mask = cv2.inRange(strip_hsv, lo_g, hi_g)
         path_mask  = cv2.inRange(strip_hsv, lo_p, hi_p)
 
-        # ── Signal A: Grass balance ───────────────────────────────────────────
         gL = int(np.count_nonzero(grass_mask[:, :mid]))
         gR = int(np.count_nonzero(grass_mask[:, mid:]))
         g_total = gL + gR
 
-        sig_A = "STRAIGHT"
+        sig_A   = "STRAIGHT"
         g_ratio = 0.0
         if g_total >= CFG["grass_min_px"]:
             g_ratio = gR / g_total
             db = CFG["grass_deadband"]
             if g_ratio > 0.5 + db:
-                sig_A = "LEFT"    # more grass RIGHT → path went LEFT → go LEFT
+                sig_A = "LEFT"
             elif g_ratio < 0.5 - db:
-                sig_A = "RIGHT"   # more grass LEFT  → path went RIGHT → go RIGHT
+                sig_A = "RIGHT"
 
-        # ── Signal B: Path balance ────────────────────────────────────────────
         pL = int(np.count_nonzero(path_mask[:, :mid]))
         pR = int(np.count_nonzero(path_mask[:, mid:]))
         p_total = pL + pR
 
-        sig_B = "STRAIGHT"
+        sig_B   = "STRAIGHT"
         p_ratio = 0.0
         if p_total >= CFG["grass_min_px"] // 2:
             p_ratio = pR / p_total
@@ -684,31 +636,24 @@ class Vision:
             elif p_ratio < 0.5 - db:
                 sig_B = "LEFT"
 
-        # ── Combine: both agree → act; only A fires → act (it's more reliable) ─
         if sig_A != "STRAIGHT" and sig_B != "STRAIGHT":
-            if sig_A == sig_B:
-                direction = sig_A          # both agree — highest confidence
-            else:
-                direction = sig_A          # grass wins on disagreement
+            direction = sig_A   # grass wins on conflict
         elif sig_A != "STRAIGHT":
-            direction = sig_A              # only grass signal — trust it
+            direction = sig_A
         elif sig_B != "STRAIGHT":
-            direction = sig_B              # only path signal
+            direction = sig_B
         else:
             direction = "STRAIGHT"
 
-        dbg = {
+        return direction, {
             "grass_L": gL, "grass_R": gR, "grass_ratio": round(g_ratio, 3),
             "path_L":  pL, "path_R":  pR, "path_ratio":  round(p_ratio, 3),
             "sig_A": sig_A, "sig_B": sig_B, "turn": direction,
         }
-        return direction, dbg
-
-    # ── Fence detection ───────────────────────────────────────────────────────
 
     def _detect_fences(self, frame, w, h):
-        lo_f  = np.array(CFG["fence_lo"], dtype=np.uint8)
-        hi_f  = np.array(CFG["fence_hi"], dtype=np.uint8)
+        lo_f = np.array(CFG["fence_lo"], dtype=np.uint8)
+        hi_f = np.array(CFG["fence_hi"], dtype=np.uint8)
 
         lx1 = int(CFG["dz_left_x"][0]  * w); lx2 = int(CFG["dz_left_x"][1]  * w)
         rx1 = int(CFG["dz_right_x"][0] * w); rx2 = int(CFG["dz_right_x"][1] * w)
@@ -719,36 +664,29 @@ class Vision:
         edges = cv2.Canny(gray, CFG["canny_lo"], CFG["canny_hi"])
 
         def analyse_zone(x1, x2, name):
-            roi_h  = zy2 - zy1
-            roi_w  = x2 - x1
-            n_px   = roi_h * roi_w
+            roi_h = zy2 - zy1
+            roi_w = x2 - x1
+            n_px  = roi_h * roi_w
             if n_px == 0:
                 return False, 0, {}
-
             roi_hsv  = hsv[zy1:zy2, x1:x2]
             roi_edge = edges[zy1:zy2, x1:x2]
 
-            # Signal 1: colour fraction
             fence_mask  = cv2.inRange(roi_hsv, lo_f, hi_f)
             colour_frac = np.count_nonzero(fence_mask) / n_px
             sig1 = colour_frac > CFG["fence_colour_frac"]
 
-            # Signal 2: edge density spike
-            # Compare top-half of danger zone vs same-height strip just above
             top_h = max(1, roi_h // 2)
-            dz_edge_dens = np.count_nonzero(roi_edge[:top_h]) / max(1, top_h * roi_w)
-            bg_y1 = max(0, zy1 - top_h)
-            bg_edge = edges[bg_y1:zy1, x1:x2]
-            bg_dens  = np.count_nonzero(bg_edge) / max(1, top_h * roi_w)
-            sig2 = (dz_edge_dens > 0.008 and
-                    bg_dens < dz_edge_dens / CFG["fence_edge_ratio"])
+            dz_dens = np.count_nonzero(roi_edge[:top_h]) / max(1, top_h * roi_w)
+            bg_y1   = max(0, zy1 - top_h)
+            bg_dens = np.count_nonzero(edges[bg_y1:zy1, x1:x2]) / max(1, top_h * roi_w)
+            sig2 = (dz_dens > 0.008 and bg_dens < dz_dens / CFG["fence_edge_ratio"])
 
-            n_sigs   = int(sig1) + int(sig2)
-            blocked  = n_sigs >= CFG["fence_min_signals"]
-
+            n_sigs  = int(sig1) + int(sig2)
+            blocked = n_sigs >= CFG["fence_min_signals"]
             return blocked, n_sigs, {
-                f"col_{name}": round(colour_frac, 3),
-                f"edge_{name}": round(dz_edge_dens, 4),
+                f"col_{name}":  round(colour_frac, 3),
+                f"edge_{name}": round(dz_dens, 4),
                 f"sigs_{name}": n_sigs,
             }
 
@@ -757,7 +695,6 @@ class Vision:
         dbg = {**l_dbg, **r_dbg}
 
         if l_blocked and r_blocked:
-            # Both blocked — dodge toward the less-blocked side
             action = "RIGHT" if l_sigs >= r_sigs else "LEFT"
         elif l_blocked:
             action = "RIGHT"
@@ -770,118 +707,86 @@ class Vision:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  VISUAL DUMP  — saves annotated frame so you can check what the bot sees
+#  VISUAL DUMP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def save_visual_dump(frame, path="bbot_debug.jpg"):
-    """
-    Saves an annotated image highlighting:
-      YELLOW  → pixels detected as PATH
-      GREEN   → pixels detected as GRASS
-      RED     → pixels detected as FENCE COLOUR
-    Also draws lookahead strip, danger zones, and tap points.
-    Pull this file to your phone/PC to verify the colours are right.
-    """
     if frame is None:
         print("[VIS] No frame to dump.")
         return
 
-    h, w  = frame.shape[:2]
-    vis   = frame.copy()
-    hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, w = frame.shape[:2]
+    vis  = frame.copy()
+    hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    grass_mask = cv2.inRange(hsv,
-                             np.array(CFG["grass_lo"], dtype=np.uint8),
-                             np.array(CFG["grass_hi"], dtype=np.uint8))
-    path_mask  = cv2.inRange(hsv,
-                             np.array(CFG["path_lo"],  dtype=np.uint8),
-                             np.array(CFG["path_hi"],  dtype=np.uint8))
-    fence_mask = cv2.inRange(hsv,
-                             np.array(CFG["fence_lo"], dtype=np.uint8),
-                             np.array(CFG["fence_hi"], dtype=np.uint8))
+    grass_mask = cv2.inRange(hsv, np.array(CFG["grass_lo"], dtype=np.uint8),
+                                  np.array(CFG["grass_hi"], dtype=np.uint8))
+    path_mask  = cv2.inRange(hsv, np.array(CFG["path_lo"],  dtype=np.uint8),
+                                  np.array(CFG["path_hi"],  dtype=np.uint8))
+    fence_mask = cv2.inRange(hsv, np.array(CFG["fence_lo"], dtype=np.uint8),
+                                  np.array(CFG["fence_hi"], dtype=np.uint8))
 
-    # Colour overlays
-    vis[path_mask  > 0] = (0,   220, 220)   # YELLOW  = path
-    vis[grass_mask > 0] = (0,   220,  50)   # GREEN   = grass
-    vis[fence_mask > 0] = (30,   30, 255)   # RED     = fence colour
+    vis[path_mask  > 0] = (0,   220, 220)   # yellow = path
+    vis[grass_mask > 0] = (0,   220,  50)   # green  = grass
+    vis[fence_mask > 0] = (30,   30, 255)   # red    = fence
 
-    # Look-ahead strip
     ly1 = int(CFG["la_top"]    * h)
     ly2 = int(CFG["la_bottom"] * h)
-    cv2.rectangle(vis, (0, ly1), (w, ly2),   (255, 255, 0), 3)
-    cv2.line(vis, (w//2, ly1), (w//2, ly2),  (255,255,255), 2)
-    cv2.putText(vis, "LOOKAHEAD (turn detection)", (6, ly1 + 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+    cv2.rectangle(vis, (0, ly1), (w, ly2), (255, 255, 0), 3)
+    cv2.line(vis, (w//2, ly1), (w//2, ly2), (255,255,255), 2)
+    cv2.putText(vis, "LOOKAHEAD", (6, ly1+22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
 
-    # Danger zones
-    lx1 = int(CFG["dz_left_x"][0]  * w); lx2 = int(CFG["dz_left_x"][1]  * w)
-    rx1 = int(CFG["dz_right_x"][0] * w); rx2 = int(CFG["dz_right_x"][1] * w)
-    zy1 = int(CFG["dz_y"][0] * h);        zy2 = int(CFG["dz_y"][1] * h)
-    cv2.rectangle(vis, (lx1, zy1), (lx2, zy2), (0,  0, 255), 2)
-    cv2.rectangle(vis, (rx1, zy1), (rx2, zy2), (0,  0, 255), 2)
-    cv2.putText(vis, "DZ-L", (lx1+4, zy1+18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
-    cv2.putText(vis, "DZ-R", (rx1+4, zy1+18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+    lx1 = int(CFG["dz_left_x"][0]*w);  lx2 = int(CFG["dz_left_x"][1]*w)
+    rx1 = int(CFG["dz_right_x"][0]*w); rx2 = int(CFG["dz_right_x"][1]*w)
+    zy1 = int(CFG["dz_y"][0]*h);        zy2 = int(CFG["dz_y"][1]*h)
+    cv2.rectangle(vis, (lx1, zy1), (lx2, zy2), (0, 0, 255), 2)
+    cv2.rectangle(vis, (rx1, zy1), (rx2, zy2), (0, 0, 255), 2)
+    cv2.putText(vis, "DZ-L", (lx1+4, zy1+20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,255), 1)
+    cv2.putText(vis, "DZ-R", (rx1+4, zy1+20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,255), 1)
 
-    # Tap positions
-    cv2.circle(vis, (int(w*CFG["tap_left_x"]),  int(h*CFG["tap_y"])), 20, (0,128,255), 3)
-    cv2.circle(vis, (int(w*CFG["tap_right_x"]), int(h*CFG["tap_y"])), 20, (0,128,255), 3)
-    cv2.putText(vis, "TAP-L", (int(w*CFG["tap_left_x"])-28,  int(h*CFG["tap_y"])-24),
+    cv2.circle(vis, (int(w*CFG["tap_left_x"]),  int(h*CFG["tap_y"])), 22, (0,128,255), 3)
+    cv2.circle(vis, (int(w*CFG["tap_right_x"]), int(h*CFG["tap_y"])), 22, (0,128,255), 3)
+    cv2.putText(vis, "TAP-L", (int(w*CFG["tap_left_x"])-30,  int(h*CFG["tap_y"])-26),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,128,255), 1)
-    cv2.putText(vis, "TAP-R", (int(w*CFG["tap_right_x"])-28, int(h*CFG["tap_y"])-24),
+    cv2.putText(vis, "TAP-R", (int(w*CFG["tap_right_x"])-30, int(h*CFG["tap_y"])-26),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,128,255), 1)
 
-    # Legend (bottom left)
+    gp = int(np.count_nonzero(grass_mask))
+    pp = int(np.count_nonzero(path_mask))
+    fp = int(np.count_nonzero(fence_mask))
+
     items = [
-        ((0,220,220), "PATH detected"),
-        ((0,220, 50), "GRASS detected"),
-        ((30, 30,255), "FENCE colour detected"),
-        ((255,255,  0), "Look-ahead strip"),
+        ((0,220,220), f"PATH  {pp}px"),
+        ((0,220, 50), f"GRASS {gp}px"),
+        ((30, 30,255), f"FENCE {fp}px"),
+        ((255,255,  0), "Lookahead"),
         ((0,  0, 255), "Danger zones"),
-        ((0,128,255), "Tap points"),
+        ((0,128,255),  "Tap points"),
     ]
-    box_y = h - len(items)*20 - 12
-    cv2.rectangle(vis, (0, box_y-4), (210, h), (15,15,15), -1)
+    box_y = h - len(items)*22 - 12
+    cv2.rectangle(vis, (0, box_y-4), (190, h), (15,15,15), -1)
     for i, (col, label) in enumerate(items):
-        y = box_y + i * 20 + 14
-        cv2.rectangle(vis, (6, y-11), (20, y+3), col, -1)
-        cv2.putText(vis, label, (26, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230,230,230), 1)
-
-    # Pixel counts
-    gp = np.count_nonzero(grass_mask)
-    pp = np.count_nonzero(path_mask)
-    fp = np.count_nonzero(fence_mask)
-    cv2.putText(vis, f"grass={gp}px  path={pp}px  fence={fp}px",
-                (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240,240,240), 1)
+        y = box_y + i*22 + 16
+        cv2.rectangle(vis, (6, y-13), (22, y+3), col, -1)
+        cv2.putText(vis, label, (28, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (230,230,230), 1)
 
     cv2.imwrite(path, vis, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
-    print(f"\n[VIS] Saved: {path}")
-    print(f"  Grass pixels detected : {gp}")
-    print(f"  Path  pixels detected : {pp}")
-    print(f"  Fence pixels detected : {fp}")
+    print(f"\n  ✅ Saved: {path}")
+    print(f"  Grass pixels : {gp}  {'⚠ LOW — raise grass_hi[1] (S max)' if gp < 500 else '✓'}")
+    print(f"  Path  pixels : {pp}  {'⚠ LOW — widen path ranges'         if pp < 500 else '✓'}")
+    print(f"  Fence pixels : {fp}  {'⚠ LOW — raise fence_hi[1] (S max)' if fp < 100 else '✓'}")
     print()
-    print("  Pull file to check visually:")
-    print(f"    adb pull {path} .")
+    print("  Colours in image:")
+    print("   YELLOW = path detected   GREEN = grass detected   RED = fence detected")
+    print("   BLUE box = lookahead strip   RED box = danger zones")
     print()
-    print("  What to look for:")
-    print("   ✓ YELLOW  covers the dirt/brown path strip")
-    print("   ✓ GREEN   covers the grass on both sides")
-    print("   ✓ RED     appears on the white fence posts")
-    print()
-    print("  If colours are wrong, adjust these in CFG:")
-    print("    path_lo / path_hi   — for yellow being wrong")
-    print("    grass_lo / grass_hi — for green being wrong")
-    print("    fence_lo / fence_hi — for red being wrong (or missing)")
+    print("  Pull to PC:  adb pull bbot_debug.jpg .")
     print()
     if gp < 500:
-        print("  ⚠ Very few grass pixels! Turn detection will be unreliable.")
-        print("    Try lowering grass_lo[1] (saturation) in CFG.")
-    if pp < 500:
-        print("  ⚠ Very few path pixels! Path signal will be weak.")
-        print("    Adjust path_lo/path_hi — or just rely on grass signal.")
+        print("  ⚠ Grass fix: menu → C → Colour Ranges → grass_hi S → raise to 255")
     if fp < 100:
-        print("  ⚠ Very few fence pixels! Fence detection may miss posts.")
-        print("    Try lowering fence_lo[2] (value) or raising fence_hi[1].")
+        print("  ⚠ Fence fix: menu → C → Colour Ranges → fence_hi S → raise slightly")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -889,7 +794,6 @@ def save_visual_dump(frame, path="bbot_debug.jpg"):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BunnyBot:
-
     def __init__(self):
         self.dm     = DeviceManager()
         self.vision = Vision()
@@ -912,7 +816,7 @@ class BunnyBot:
 
     def run(self):
         delay = CFG["startup_delay"]
-        print(f"[BOT] Starting in {delay}s — switch to the game now!")
+        print(f"\n[BOT] Starting in {delay}s — switch to the game now!")
         for i in range(delay, 0, -1):
             print(f"  {i}…", end="\r", flush=True)
             time.sleep(1)
@@ -932,8 +836,7 @@ class BunnyBot:
                 raise
             except Exception as e:
                 print(f"[WARN] Tick error: {e}")
-                if CFG["debug"]:
-                    traceback.print_exc()
+                if CFG["debug"]: traceback.print_exc()
                 time.sleep(0.3)
             spare = period - (time.time() - t0)
             if spare > 0:
@@ -950,7 +853,7 @@ class BunnyBot:
                 self.dm.reconnect()
                 self.consecutive_fails = 0
             return
-        self.consecutive_fails      = 0
+        self.consecutive_fails       = 0
         self.screen_w, self.screen_h = frame.shape[1], frame.shape[0]
 
         action, dbg = self.vision.decide(frame)
@@ -993,14 +896,11 @@ class BunnyBot:
 
     def _save_debug_frame(self, frame, action, dbg, w, h):
         vis = frame.copy()
-        col = {"LEFT":(0,165,255), "RIGHT":(0,165,255),
-               "RESTART":(0,0,255), "STRAIGHT":(0,220,0)}.get(action, (180,180,180))
-        cv2.putText(vis, action, (15, 55),  cv2.FONT_HERSHEY_SIMPLEX, 1.8, col, 4)
-        cv2.putText(vis, dbg.get("reason",""), (15, 100),
+        col = {"LEFT":(0,165,255),"RIGHT":(0,165,255),
+               "RESTART":(0,0,255),"STRAIGHT":(0,220,0)}.get(action,(180,180,180))
+        cv2.putText(vis, action, (15,55), cv2.FONT_HERSHEY_SIMPLEX, 1.8, col, 4)
+        cv2.putText(vis, dbg.get("reason",""), (15,100),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        info = (f"A={dbg.get('sig_A','')} B={dbg.get('sig_B','')} "
-                f"gL={dbg.get('grass_L','')} gR={dbg.get('grass_R','')}")
-        cv2.putText(vis, info, (15, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,255,200), 1)
         os.makedirs("debug_frames", exist_ok=True)
         cv2.imwrite(f"debug_frames/{self.frame_count:06d}_{action}.jpg",
                     vis, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -1008,168 +908,725 @@ class BunnyBot:
     def print_stats(self):
         elapsed = max(time.time() - self.start_time, 0.001)
         fps     = self.frame_count / elapsed
-        print(f"\n[BOT] {elapsed:.0f}s | {self.frame_count} frames | "
+        print(f"\n[BOT] Ran for {elapsed:.0f}s | {self.frame_count} frames | "
               f"{fps:.1f}fps avg | backend: {self.dm.backend_name}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  INTERACTIVE MENU
+#  MENU SYSTEM — Clean, Categorised, Informative
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BANNER = """
-╔══════════════════════════════════════════════════════════════════╗
-║      🐰  BunnyBot v5 — Bunny Runner 3D  (Vision Overhaul)      ║
-║      Tuned to real game colours  •  Grass-primary detection    ║
-╚══════════════════════════════════════════════════════════════════╝"""
+W = 66  # menu width
+
+def _line(text="", pad=True):
+    if text == "":
+        print("║" + " "*(W-2) + "║")
+        return
+    inner = W - 4
+    print("║  " + text.ljust(inner)[:inner] + "  ║")
+
+def _divider(label=""):
+    if label:
+        side = (W - len(label) - 4) // 2
+        print("╠" + "─"*side + "  " + label + "  " + "─"*(W-side-len(label)-4) + "╣")
+    else:
+        print("╠" + "═"*(W-2) + "╣")
+
+def _top():
+    print("╔" + "═"*(W-2) + "╗")
+
+def _bot():
+    print("╚" + "═"*(W-2) + "╝")
+
+def _sep():
+    print("╠" + "─"*(W-2) + "╣")
+
+def show_status(bot):
+    dev   = CFG["device"] or "(auto-detect)"
+    bknd  = bot.dm.backend_name
+    au    = "✓ installed" if ADBUTILS_OK else "✗ not installed  pip install adbutils"
+    saved = "✓ Saved" if SETTINGS_FILE.exists() else "✗ Not saved yet"
+    nl    = f"+{CFG['night_light_shift']}" if CFG['night_light_shift'] else "OFF"
+    fps   = CFG['loop_fps']
+    cool  = CFG['action_cooldown']
+    dbg   = "ON" if CFG["debug"] else "OFF"
+
+    _top()
+    _line("🐰  BunnyBot v6 — Bunny Runner 3D")
+    _line("Settings auto-save on every change • Delete bunnybot_settings.json to full reset")
+    _sep()
+    _line(f"Device      : {dev}")
+    _line(f"Backend     : {bknd}   │  adbutils: {au}")
+    _line(f"Night light : {nl}   │  FPS: {fps}   │  Cooldown: {cool}s   │  Debug: {dbg}")
+    _line(f"Settings    : {saved}")
+    _divider()
 
 
-def show_menu(bot: BunnyBot):
-    dev  = CFG["device"] or "(auto)"
-    au   = "✓ installed" if ADBUTILS_OK else "✗ not installed"
-    dbg  = "ON"  if CFG["debug"]             else "OFF"
-    sav  = "ON"  if CFG["debug_save_frames"] else "OFF"
-    bknd = bot.dm.backend_name
-    print(f"""
-┌──────────────────────────────────────────────────────────────┐
-│  Device           : {dev:<42}│
-│  Active backend   : {bknd:<42}│
-│  adbutils         : {au:<42}│
-│  Debug log        : {dbg:<42}│
-│  Save frames      : {sav:<42}│
-├──────────────────────────────────────────────────────────────┤
-│  0   Full diagnostics (both backends)                        │
-│  1   Set target device         (blank = auto)                │
-│  B   Set backend               (auto / adbutils / adb)       │
-│  2   Change loop FPS           (default {CFG['loop_fps']})                     │
-│  3   Change action cooldown    (default {CFG['action_cooldown']}s)               │
-│  4   Toggle debug logging      (currently {dbg})                 │
-│  5   Toggle save debug frames  (currently {sav})                 │
-│  6   Change game package name                                │
-│  7   Fence sensitivity         (signals: {CFG['fence_min_signals']}/2)               │
-│  8   Grass deadband            (current: {CFG['grass_deadband']*100:.0f}%)              │
-│  9   Screencap method          ({CFG['screencap_method']})                   │
-│  NL  Adjust for night light mode (shifts HSV ranges)         │
-│                                                              │
-│  V   Visual dump — see EXACTLY what the bot sees             │
-│  S   START the bot                                           │
-│  Q   Quit                                                    │
-└──────────────────────────────────────────────────────────────┘""")
+def show_main_menu(bot):
+    show_status(bot)
+    _line("MAIN MENU — choose a category or action")
+    _sep()
+    _line("  C   ► Colour Tuning          (grass, path, fence, night light)")
+    _line("  T   ► Timing & Speed         (FPS, cooldown, reaction speed)")
+    _line("  R   ► Reaction Sensitivity   (turn sharpness, fence strictness)")
+    _line("  Z   ► Zone Positions         (lookahead, danger zones, tap spots)")
+    _line("  D   ► Device & Connection    (ADB, backend, screencap method)")
+    _line("  X   ► Reset Options          (reset specific groups or factory reset)")
+    _sep()
+    _line("  V   ► Visual Dump            (see what the bot sees — do this first!)")
+    _line("  0   ► Full Diagnostics       (test ADB connection + screencap)")
+    _line("  S   ► START BOT              (launches the bot)")
+    _line("  Q   ► Quit")
+    _bot()
 
 
-def apply_night_light_shift(amount: int):
-    """
-    Night light mode warms the screen (shifts H higher, reduces blue).
-    amount = 0 (off) to 15 (max).
-    Shifts all HSV hue ranges by +amount.
-    """
-    for key in ("grass_lo", "grass_hi", "path_lo", "path_hi",
-                "fence_lo", "fence_hi"):
-        lo_or_hi = CFG[key]
-        lo_or_hi[0] = min(179, lo_or_hi[0] + amount)
-    print(f"  ✓ Night light shift of +{amount} applied to all HSV hue ranges.")
-    print("    If colours are still wrong, use V to check and adjust manually.")
+# ─────────────────── COLOUR TUNING SUBMENU ───────────────────
 
-
-def menu():
-    print(BANNER)
-    bot = BunnyBot()
-
+def menu_colours(bot):
     while True:
-        show_menu(bot)
+        nl = CFG["night_light_shift"]
+        _top()
+        _line("COLOUR TUNING")
+        _line("Use 'V' (visual dump) to see which colours are detected.")
+        _line("YELLOW=path  GREEN=grass  RED=fence  on the debug image.")
+        _sep()
+        _line("NIGHT LIGHT (do this FIRST if you use night light mode)")
+        _line(f"  NL  ► Apply night light H-shift    current: +{nl}")
+        _line("        Night light warms colours → shifts Hue +5 to +15")
+        _line("        Effect: fixes washed-out colour detection")
+        _line("        Start with NL=8, check with V, adjust if needed")
+        _sep()
+        _line("GRASS COLOUR  (olive green — most important for turn detection)")
+        _line(f"  G1  ► H min/max  [{CFG['grass_lo'][0]}, {CFG['grass_hi'][0]}]")
+        _line("        Lower H-min if grass appears orange/red on V dump")
+        _line("        Raise H-max if sky/other greens trigger false turns")
+        _line(f"  G2  ► S min/max  [{CFG['grass_lo'][1]}, {CFG['grass_hi'][1]}]")
+        _line("        Lower S-min if too few green pixels (grass not detected)")
+        _line(f"  G3  ► V min/max  [{CFG['grass_lo'][2]}, {CFG['grass_hi'][2]}]")
+        _line("        Lower V-min if grass appears dark/shadowed")
+        _sep()
+        _line("PATH COLOUR  (brown dirt — backup signal for turns)")
+        _line(f"  P1  ► H min/max  [{CFG['path_lo'][0]}, {CFG['path_hi'][0]}]")
+        _line(f"  P2  ► S min/max  [{CFG['path_lo'][1]}, {CFG['path_hi'][1]}]")
+        _line("        KEEP S-min above 45! Below that = fence pixels bleed in")
+        _line(f"  P3  ► V min/max  [{CFG['path_lo'][2]}, {CFG['path_hi'][2]}]")
+        _sep()
+        _line("FENCE COLOUR  (cream/white posts — obstacle avoidance)")
+        _line(f"  F1  ► H min/max  [{CFG['fence_lo'][0]}, {CFG['fence_hi'][0]}]")
+        _line(f"  F2  ► S max      [{CFG['fence_hi'][1]}]  (keep LOW — fence is near-white)")
+        _line("        Raise S-max if fence posts are not detected (red on V)")
+        _line("        Don't raise above 80 or path pixels bleed in")
+        _line(f"  F3  ► V min      [{CFG['fence_lo'][2]}]  (keep HIGH — fence is bright)")
+        _sep()
+        _line("  V   ► Visual dump (check current colours)")
+        _line("  B   ► Back to main menu")
+        _bot()
+
         c = input("  Option: ").strip().lower()
 
-        if c == "0":
-            bot.dm.run_diagnostics()
+        if c == "b": break
+
+        elif c == "nl":
+            print("\n  Night light H-shift")
+            print("  0 = off (normal screen)")
+            print("  8 = typical night light")
+            print("  15 = maximum (very warm/orange screen)")
+            print("  ⚠ This ADDS to current shift. Use 0 to fully reset first.")
+            old = CFG["night_light_shift"]
+            try:
+                v = int(input(f"  Amount 0-15 [currently applied: +{old}]: "))
+                v = max(0, min(15, v))
+                # Reset all colours to defaults first, then apply fresh shift
+                for key in ("grass_lo","grass_hi","path_lo","path_hi","fence_lo","fence_hi"):
+                    CFG[key] = list(_DEFAULTS[key])
+                CFG["night_light_shift"] = 0
+                if v > 0:
+                    _apply_nl_shift(v)
+                else:
+                    print("  ✓ Night light OFF — colours reset to default")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c in ("g1","g2","g3","p1","p2","p3","f1","f2","f3"):
+            _edit_colour(c)
+
+        elif c == "v":
+            _do_visual_dump(bot)
+
+        else:
+            print("  Unknown option.")
+
+
+def _apply_nl_shift(amount):
+    for key in ("grass_lo","grass_hi","path_lo","path_hi","fence_lo","fence_hi"):
+        CFG[key][0] = min(179, CFG[key][0] + amount)
+    CFG["night_light_shift"] = amount
+    print(f"  ✓ Night light +{amount} applied to all H ranges")
+
+
+def _edit_colour(code):
+    """Generic HSV range editor."""
+    mapping = {
+        "g1": ("grass", 0, "H (hue)"),
+        "g2": ("grass", 1, "S (saturation)"),
+        "g3": ("grass", 2, "V (brightness)"),
+        "p1": ("path",  0, "H (hue)"),
+        "p2": ("path",  1, "S (saturation)"),
+        "p3": ("path",  2, "V (brightness)"),
+        "f1": ("fence", 0, "H (hue)"),
+        "f2": ("fence", 1, "S (saturation)"),
+        "f3": ("fence", 2, "V (brightness)"),
+    }
+    name, idx, label = mapping[code]
+    lo_key = f"{name}_lo"
+    hi_key = f"{name}_hi"
+    lo_cur = CFG[lo_key][idx]
+    hi_cur = CFG[hi_key][idx]
+
+    print(f"\n  {name.upper()} — {label}")
+    print(f"  Current range: {lo_cur} to {hi_cur}  (0-255 scale)")
+
+    if name == "fence" and idx == 1:
+        print("  ⚠ For fence saturation: only edit the MAX (hi). Keep min at 0.")
+        try:
+            v = int(input(f"  New S max [current {hi_cur}, default {_DEFAULTS[hi_key][idx]}]: "))
+            CFG[hi_key][idx] = max(0, min(255, v))
+            print(f"  ✓ fence_hi S → {CFG[hi_key][idx]}")
+            _autosave()
+        except ValueError: print("  Invalid.")
+        return
+
+    try:
+        lo_new = int(input(f"  New min [{lo_cur}] (enter to keep): ") or lo_cur)
+        hi_new = int(input(f"  New max [{hi_cur}] (enter to keep): ") or hi_cur)
+        lo_new = max(0, min(255, lo_new))
+        hi_new = max(0, min(255, hi_new))
+        if lo_new > hi_new:
+            print("  ⚠ Min must be ≤ max — swapping.")
+            lo_new, hi_new = hi_new, lo_new
+        CFG[lo_key][idx] = lo_new
+        CFG[hi_key][idx] = hi_new
+        print(f"  ✓ {lo_key}[{idx}]={lo_new}  {hi_key}[{idx}]={hi_new}")
+        _autosave()
+    except ValueError:
+        print("  Invalid.")
+
+
+# ─────────────────── TIMING SUBMENU ───────────────────
+
+def menu_timing(bot):
+    while True:
+        _top()
+        _line("TIMING & SPEED")
+        _sep()
+        _line(f"  1   ► Loop FPS            current: {CFG['loop_fps']}")
+        _line("        How many screenshots per second the bot takes.")
+        _line("        Higher = faster reaction, higher CPU/battery use.")
+        _line("        🐢 Too low (< 8): misses fast turns")
+        _line("        🐇 10-15: sweet spot   20+: very aggressive")
+        _sep()
+        _line(f"  2   ► Action cooldown      current: {CFG['action_cooldown']}s")
+        _line("        Minimum time between two taps.")
+        _line("        🐢 Too high (> 0.4): can't handle rapid back-to-back turns")
+        _line("        🐇 Too low (< 0.1): spammy taps, rabbit zigzags")
+        _line("        Rabbit going too fast? Raise to 0.25-0.35")
+        _line("        Missing turns? Lower to 0.10-0.15")
+        _sep()
+        _line(f"  3   ► Startup delay        current: {CFG['startup_delay']}s")
+        _line("        Seconds after pressing S before the bot activates.")
+        _line("        Gives you time to switch to the game.")
+        _sep()
+        _line(f"  4   ► Frame confirmation   current: {CFG['vote_confirm']} frame(s)")
+        _line("        How many consecutive frames must agree before turning.")
+        _line("        1 = instant reaction (can be twitchy on bad screenshots)")
+        _line("        2 = smoother but ~100ms slower at 10fps")
+        _line("        Rabbit zigzagging randomly? Raise to 2")
+        _sep()
+        _line("  B   ► Back")
+        _bot()
+
+        c = input("  Option: ").strip().lower()
+        if c == "b": break
+
+        elif c == "1":
+            try:
+                v = int(input(f"  FPS 1-30 [current {CFG['loop_fps']}]: "))
+                CFG["loop_fps"] = max(1, min(30, v))
+                print(f"  ✓ loop_fps → {CFG['loop_fps']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "2":
+            try:
+                v = float(input(f"  Cooldown seconds [current {CFG['action_cooldown']}]: "))
+                CFG["action_cooldown"] = max(0.05, min(2.0, v))
+                print(f"  ✓ action_cooldown → {CFG['action_cooldown']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "3":
+            try:
+                v = int(input(f"  Startup delay seconds [current {CFG['startup_delay']}]: "))
+                CFG["startup_delay"] = max(1, min(30, v))
+                print(f"  ✓ startup_delay → {CFG['startup_delay']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "4":
+            try:
+                v = int(input(f"  Frame confirmation 1-3 [current {CFG['vote_confirm']}]: "))
+                CFG["vote_confirm"] = max(1, min(3, v))
+                print(f"  ✓ vote_confirm → {CFG['vote_confirm']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        else:
+            print("  Unknown option.")
+
+
+# ─────────────────── REACTION SENSITIVITY SUBMENU ───────────────────
+
+def menu_reaction(bot):
+    while True:
+        gdb = int(CFG['grass_deadband']*100)
+        pdb = int(CFG['path_deadband']*100)
+        _top()
+        _line("REACTION SENSITIVITY")
+        _line("These control HOW MUCH the scene must change before the bot turns.")
+        _sep()
+        _line("TURN DETECTION")
+        _line(f"  1   ► Grass deadband       current: {gdb}%")
+        _line("        How lopsided grass must be (L vs R) before turning.")
+        _line("        🐢 Too high (> 20%): misses gentle turns, turns late")
+        _line("        🐇 Too low  (< 8%):  phantom turns on straight paths")
+        _line("        Recommended: 10-15%  │  Jittery? Raise it.")
+        _sep()
+        _line(f"  2   ► Path deadband         current: {pdb}%")
+        _line("        Same concept but for the dirt path signal (backup).")
+        _line("        Usually keep 2-3% below grass deadband.")
+        _sep()
+        _line(f"  3   ► Min grass pixels      current: {CFG['grass_min_px']}")
+        _line("        Minimum grass pixels needed before trusting the signal.")
+        _line("        Low on grass in frame? Lower this (try 100).")
+        _line("        False turns at game start? Raise this (try 400).")
+        _sep()
+        _line("FENCE DETECTION")
+        _line(f"  4   ► Fence signals needed  current: {CFG['fence_min_signals']}/2")
+        _line("        1 = trigger on ANY fence signal (more sensitive)")
+        _line("        2 = need BOTH signals to agree (fewer false dodges)")
+        _line("        Bumping into fences? Set to 1")
+        _line("        Dodging when no fence? Set to 2")
+        _sep()
+        _line(f"  5   ► Fence colour fraction current: {CFG['fence_colour_frac']:.3f}")
+        _line("        % of danger zone that must be fence-coloured.")
+        _line("        Lower = catches thin/partial fence views")
+        _line("        0.03 = very sensitive   0.08 = less sensitive")
+        _sep()
+        _line(f"  6   ► Fence edge ratio      current: {CFG['fence_edge_ratio']}")
+        _line("        How much more edges the fence zone needs vs background.")
+        _line("        Lower = more fence dodges   Higher = fewer, stricter")
+        _sep()
+        _line("  B   ► Back")
+        _bot()
+
+        c = input("  Option: ").strip().lower()
+        if c == "b": break
+
+        elif c == "1":
+            try:
+                v = float(input(f"  Grass deadband % [current {gdb}]: "))
+                CFG["grass_deadband"] = max(3, min(45, v)) / 100
+                print(f"  ✓ grass_deadband → {CFG['grass_deadband']:.2f} ({v:.0f}%)")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "2":
+            try:
+                v = float(input(f"  Path deadband % [current {pdb}]: "))
+                CFG["path_deadband"] = max(3, min(45, v)) / 100
+                print(f"  ✓ path_deadband → {CFG['path_deadband']:.2f}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "3":
+            try:
+                v = int(input(f"  Min grass pixels [current {CFG['grass_min_px']}]: "))
+                CFG["grass_min_px"] = max(50, min(2000, v))
+                print(f"  ✓ grass_min_px → {CFG['grass_min_px']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "4":
+            try:
+                v = int(input("  Fence signals needed [1 or 2]: "))
+                CFG["fence_min_signals"] = max(1, min(2, v))
+                print(f"  ✓ fence_min_signals → {CFG['fence_min_signals']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "5":
+            try:
+                v = float(input(f"  Fence colour fraction [current {CFG['fence_colour_frac']}]: "))
+                CFG["fence_colour_frac"] = max(0.01, min(0.30, v))
+                print(f"  ✓ fence_colour_frac → {CFG['fence_colour_frac']:.3f}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "6":
+            try:
+                v = float(input(f"  Fence edge ratio [current {CFG['fence_edge_ratio']}]: "))
+                CFG["fence_edge_ratio"] = max(1.0, min(5.0, v))
+                print(f"  ✓ fence_edge_ratio → {CFG['fence_edge_ratio']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        else:
+            print("  Unknown option.")
+
+
+# ─────────────────── ZONE POSITIONS SUBMENU ───────────────────
+
+def menu_zones(bot):
+    while True:
+        _top()
+        _line("ZONE POSITIONS  (all values are 0.0-1.0 fraction of screen)")
+        _sep()
+        _line("LOOKAHEAD STRIP  (horizontal band analysed for turns)")
+        _line(f"  L1  ► Top edge      current: {CFG['la_top']:.2f}  ({int(CFG['la_top']*100)}% from top)")
+        _line(f"  L2  ► Bottom edge   current: {CFG['la_bottom']:.2f}  ({int(CFG['la_bottom']*100)}% from top)")
+        _line("        Too far up? Bot sees the horizon not the path → late turns")
+        _line("        Too far down? Bot sees behind itself → misses upcoming turns")
+        _sep()
+        _line("TAP POSITIONS  (where taps are sent on screen)")
+        _line(f"  T1  ► Left tap X    current: {CFG['tap_left_x']:.2f}  ({int(CFG['tap_left_x']*100)}% from left)")
+        _line(f"  T2  ► Right tap X   current: {CFG['tap_right_x']:.2f}  ({int(CFG['tap_right_x']*100)}% from left)")
+        _line(f"  T3  ► Tap Y         current: {CFG['tap_y']:.2f}  ({int(CFG['tap_y']*100)}% from top)")
+        _line("        Taps not registering? Adjust Y — try 0.5 to 0.8")
+        _sep()
+        _line("DANGER ZONES  (areas scanned for fence posts)")
+        _line(f"  D1  ► Left zone X   current: {CFG['dz_left_x'][0]:.2f} to {CFG['dz_left_x'][1]:.2f}")
+        _line(f"  D2  ► Right zone X  current: {CFG['dz_right_x'][0]:.2f} to {CFG['dz_right_x'][1]:.2f}")
+        _line(f"  D3  ► Zone height   current: {CFG['dz_y'][0]:.2f} to {CFG['dz_y'][1]:.2f}")
+        _line("        Use V (visual dump) to see red DZ boxes — adjust if wrong")
+        _sep()
+        _line("  B   ► Back")
+        _bot()
+
+        c = input("  Option: ").strip().lower()
+        if c == "b": break
+
+        elif c == "l1":
+            try:
+                v = float(input(f"  la_top [current {CFG['la_top']}]: "))
+                CFG["la_top"] = max(0.0, min(CFG["la_bottom"]-0.05, v))
+                print(f"  ✓ la_top → {CFG['la_top']:.2f}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "l2":
+            try:
+                v = float(input(f"  la_bottom [current {CFG['la_bottom']}]: "))
+                CFG["la_bottom"] = max(CFG["la_top"]+0.05, min(1.0, v))
+                print(f"  ✓ la_bottom → {CFG['la_bottom']:.2f}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "t1":
+            try:
+                v = float(input(f"  tap_left_x [current {CFG['tap_left_x']}]: "))
+                CFG["tap_left_x"] = max(0.0, min(0.49, v))
+                print(f"  ✓ tap_left_x → {CFG['tap_left_x']:.2f}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "t2":
+            try:
+                v = float(input(f"  tap_right_x [current {CFG['tap_right_x']}]: "))
+                CFG["tap_right_x"] = max(0.51, min(1.0, v))
+                print(f"  ✓ tap_right_x → {CFG['tap_right_x']:.2f}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "t3":
+            try:
+                v = float(input(f"  tap_y [current {CFG['tap_y']}]: "))
+                CFG["tap_y"] = max(0.0, min(1.0, v))
+                print(f"  ✓ tap_y → {CFG['tap_y']:.2f}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "d1":
+            try:
+                a = float(input(f"  dz_left_x start [current {CFG['dz_left_x'][0]}]: "))
+                b_v = float(input(f"  dz_left_x end   [current {CFG['dz_left_x'][1]}]: "))
+                CFG["dz_left_x"] = (max(0,min(1,a)), max(0,min(1,b_v)))
+                print(f"  ✓ dz_left_x → {CFG['dz_left_x']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "d2":
+            try:
+                a = float(input(f"  dz_right_x start [current {CFG['dz_right_x'][0]}]: "))
+                b_v = float(input(f"  dz_right_x end   [current {CFG['dz_right_x'][1]}]: "))
+                CFG["dz_right_x"] = (max(0,min(1,a)), max(0,min(1,b_v)))
+                print(f"  ✓ dz_right_x → {CFG['dz_right_x']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        elif c == "d3":
+            try:
+                a = float(input(f"  dz_y top    [current {CFG['dz_y'][0]}]: "))
+                b_v = float(input(f"  dz_y bottom [current {CFG['dz_y'][1]}]: "))
+                CFG["dz_y"] = (max(0,min(1,a)), max(0,min(1,b_v)))
+                print(f"  ✓ dz_y → {CFG['dz_y']}")
+                _autosave()
+            except ValueError: print("  Invalid.")
+
+        else:
+            print("  Unknown option.")
+
+
+# ─────────────────── DEVICE SUBMENU ───────────────────
+
+def menu_device(bot):
+    while True:
+        _top()
+        _line("DEVICE & CONNECTION")
+        _sep()
+        _line(f"  1   ► Set device IP:PORT   current: {CFG['device'] or '(auto)'}")
+        _line("        Leave blank to auto-detect any connected device.")
+        _line(f"  2   ► Set backend           current: {CFG['backend']}")
+        _line("        auto = try adbutils then adb subprocess")
+        _line("        adbutils = pure Python, most reliable")
+        _line("        adb = requires adb binary installed")
+        _line(f"  3   ► Screencap method      current: {CFG['screencap_method']}")
+        _line("        auto tries all methods. Change if screencap fails.")
+        _line("  4   ► Set game package name")
+        _line(f"        current: {CFG['game_package']}")
+        _line("  5   ► Toggle debug logging")
+        _line(f"        current: {'ON' if CFG['debug'] else 'OFF'}")
+        _line("        Shows per-frame decisions in terminal while running")
+        _line("  6   ► Toggle save debug frames")
+        _line(f"        current: {'ON' if CFG['debug_save_frames'] else 'OFF'}")
+        _line("        Saves annotated JPGs to ./debug_frames/ (uses disk space)")
+        _sep()
+        _line("  0   ► Full diagnostics (test all backends + screencap methods)")
+        _line("  B   ► Back")
+        _bot()
+
+        c = input("  Option: ").strip().lower()
+        if c == "b": break
 
         elif c == "1":
             v = input("  IP:PORT (blank=auto): ").strip()
             CFG["device"] = v
             bot.dm = DeviceManager()
-
-        elif c == "b":
-            v = input("  [auto/adbutils/adb]: ").strip().lower()
-            if v in ("auto", "adbutils", "adb"):
-                CFG["backend"] = v
-                bot.dm = DeviceManager()
-                print(f"  Backend → {v}")
-            else:
-                print("  Use: auto / adbutils / adb")
+            print(f"  ✓ device → '{v or 'auto'}'")
+            _autosave()
 
         elif c == "2":
-            try:
-                v = int(input(f"  FPS 1-30 [current {CFG['loop_fps']}]: "))
-                CFG["loop_fps"] = max(1, min(30, v))
-            except ValueError: print("  Invalid.")
+            v = input("  [auto/adbutils/adb]: ").strip().lower()
+            if v in ("auto","adbutils","adb"):
+                CFG["backend"] = v
+                bot.dm = DeviceManager()
+                print(f"  ✓ backend → {v}")
+                _autosave()
+            else: print("  Invalid.")
 
         elif c == "3":
-            try:
-                v = float(input(f"  Cooldown s [current {CFG['action_cooldown']}]: "))
-                CFG["action_cooldown"] = max(0.05, v)
-            except ValueError: print("  Invalid.")
+            v = input("  [auto/exec-out/local/pull]: ").strip().lower()
+            if v in ("auto","exec-out","local","pull"):
+                CFG["screencap_method"] = v
+                bot.dm._adb._cap_method = v
+                print(f"  ✓ screencap_method → {v}")
+                _autosave()
+            else: print("  Invalid.")
 
         elif c == "4":
-            CFG["debug"] = not CFG["debug"]
-            print(f"  Debug: {'ON' if CFG['debug'] else 'OFF'}")
+            v = input(f"  Package [{CFG['game_package']}]: ").strip()
+            if v:
+                CFG["game_package"] = v
+                print(f"  ✓ game_package → {v}")
+                _autosave()
 
         elif c == "5":
-            CFG["debug_save_frames"] = not CFG["debug_save_frames"]
-            print(f"  Frame saving: {'ON' if CFG['debug_save_frames'] else 'OFF'}")
+            CFG["debug"] = not CFG["debug"]
+            print(f"  ✓ debug → {'ON' if CFG['debug'] else 'OFF'}")
+            _autosave()
 
         elif c == "6":
-            v = input(f"  Package [{CFG['game_package']}]: ").strip()
-            if v: CFG["game_package"] = v
+            CFG["debug_save_frames"] = not CFG["debug_save_frames"]
+            print(f"  ✓ debug_save_frames → {'ON' if CFG['debug_save_frames'] else 'OFF'}")
+            _autosave()
 
-        elif c == "7":
-            try:
-                v = int(input("  Min fence signals [1=sensitive, 2=strict]: "))
-                CFG["fence_min_signals"] = max(1, min(2, v))
-                print(f"  fence_min_signals → {CFG['fence_min_signals']}")
-            except ValueError: print("  Invalid.")
+        elif c == "0":
+            bot.dm.run_diagnostics()
 
-        elif c == "8":
-            try:
-                v = float(input(f"  Grass deadband % [current {CFG['grass_deadband']*100:.0f}]: "))
-                CFG["grass_deadband"] = max(0.03, min(0.45, v / 100))
-            except ValueError: print("  Invalid.")
+        else: print("  Unknown option.")
+
+
+# ─────────────────── RESET SUBMENU ───────────────────
+
+def menu_reset():
+    while True:
+        _top()
+        _line("RESET OPTIONS")
+        _line("Resets individual groups without touching other settings.")
+        _sep()
+        _line("  1   ► Reset COLOURS only    (grass/path/fence + night light)")
+        _line("  2   ► Reset TIMING only     (FPS, cooldown, delay, vote_confirm)")
+        _line("  3   ► Reset SENSITIVITY only (deadbands, fence thresholds)")
+        _line("  4   ► Reset ZONES only      (lookahead, danger zones, tap spots)")
+        _sep()
+        _line("  9   ► FULL FACTORY RESET    (resets EVERYTHING)")
+        _line("  B   ► Back")
+        _bot()
+
+        c = input("  Option: ").strip().lower()
+        if c == "b": break
+
+        elif c == "1":
+            confirm = input("  Reset colours to defaults? [y/N]: ").strip().lower()
+            if confirm == "y":
+                reset_group(CFG, _DEFAULTS, [
+                    "grass_lo","grass_hi","path_lo","path_hi",
+                    "fence_lo","fence_hi","night_light_shift"
+                ])
+                print("  ✓ Colours reset.")
+                _autosave()
+
+        elif c == "2":
+            confirm = input("  Reset timing to defaults? [y/N]: ").strip().lower()
+            if confirm == "y":
+                reset_group(CFG, _DEFAULTS, [
+                    "loop_fps","startup_delay","action_cooldown","vote_confirm"
+                ])
+                print("  ✓ Timing reset.")
+                _autosave()
+
+        elif c == "3":
+            confirm = input("  Reset sensitivity to defaults? [y/N]: ").strip().lower()
+            if confirm == "y":
+                reset_group(CFG, _DEFAULTS, [
+                    "grass_min_px","grass_deadband","path_deadband",
+                    "fence_colour_frac","canny_lo","canny_hi",
+                    "fence_edge_ratio","fence_min_signals",
+                ])
+                print("  ✓ Sensitivity reset.")
+                _autosave()
+
+        elif c == "4":
+            confirm = input("  Reset zones to defaults? [y/N]: ").strip().lower()
+            if confirm == "y":
+                reset_group(CFG, _DEFAULTS, [
+                    "la_top","la_bottom",
+                    "dz_left_x","dz_right_x","dz_y",
+                    "tap_left_x","tap_right_x","tap_y",
+                ])
+                print("  ✓ Zones reset.")
+                _autosave()
 
         elif c == "9":
-            v = input("  [auto/exec-out/local/pull]: ").strip().lower()
-            if v in ("auto", "exec-out", "local", "pull"):
-                CFG["screencap_method"]       = v
-                bot.dm._adb._cap_method = v
-            else:
-                print("  Unknown method.")
+            confirm = input("  FULL RESET — are you sure? Type YES: ").strip()
+            if confirm == "YES":
+                for k, v in _DEFAULTS.items():
+                    if isinstance(v, list): CFG[k] = list(v)
+                    elif isinstance(v, tuple): CFG[k] = tuple(v)
+                    else: CFG[k] = v
+                if SETTINGS_FILE.exists():
+                    SETTINGS_FILE.unlink()
+                print("  ✓ Full factory reset complete. Settings file deleted.")
 
-        elif c == "nl":
-            try:
-                v = int(input("  Night light H-shift amount 0-15 [0=off, 10=typical]: "))
-                apply_night_light_shift(max(0, min(15, v)))
-            except ValueError: print("  Invalid.")
+        else:
+            print("  Unknown option.")
+
+
+# ─────────────────── HELPERS ───────────────────
+
+def _autosave():
+    """Save settings silently after every change."""
+    save_settings(CFG)
+
+
+def _do_visual_dump(bot):
+    print("  Capturing frame…")
+    if not bot.dm.backend:
+        if not bot.dm.setup():
+            print("  Fix connection first."); return
+    frame = bot.dm.screencap()
+    if frame is not None:
+        save_visual_dump(frame, "bbot_debug.jpg")
+        print("\n  Pull to your PC:  adb pull bbot_debug.jpg .")
+    else:
+        print("  Screencap failed. Go to Device menu → Full diagnostics.")
+
+
+def apply_night_light_shift(amount: int):
+    for key in ("grass_lo","grass_hi","path_lo","path_hi","fence_lo","fence_hi"):
+        lo_or_hi = CFG[key]
+        lo_or_hi[0] = min(179, lo_or_hi[0] + amount)
+    print(f"  ✓ Night light shift of +{amount} applied to all HSV hue ranges.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN MENU LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BANNER = """
+╔══════════════════════════════════════════════════════════════════════╗
+║   🐰  BunnyBot v6 — Bunny Runner 3D                                ║
+║   Persistent Settings • Guided Tuning • Granular Controls          ║
+╚══════════════════════════════════════════════════════════════════════╝"""
+
+
+def menu():
+    print(BANNER)
+
+    if _loaded:
+        print(f"  ✅ Settings loaded from {SETTINGS_FILE}\n")
+    else:
+        print("  ℹ  No saved settings found — using factory defaults.\n")
+
+    bot = BunnyBot()
+
+    while True:
+        show_main_menu(bot)
+        c = input("  Option: ").strip().lower()
+
+        if c == "c":
+            menu_colours(bot)
+
+        elif c == "t":
+            menu_timing(bot)
+
+        elif c == "r":
+            menu_reaction(bot)
+
+        elif c == "z":
+            menu_zones(bot)
+
+        elif c == "d":
+            menu_device(bot)
+
+        elif c == "x":
+            menu_reset()
 
         elif c == "v":
-            print("  Capturing frame…")
-            if not bot.dm.backend:
-                if not bot.dm.setup():
-                    print("  Fix connection first."); continue
-            frame = bot.dm.screencap()
-            if frame is not None:
-                save_visual_dump(frame, "bbot_debug.jpg")
-                print("\n  To view on PC:")
-                print("    adb pull bbot_debug.jpg .")
-            else:
-                print("  Screencap failed. Run 0 to diagnose.")
+            _do_visual_dump(bot)
+
+        elif c == "0":
+            bot.dm.run_diagnostics()
 
         elif c == "s":
             if not bot.setup():
-                print("\n  Fix the issues above first.\n"); continue
-            # One visual dump before starting so user can verify colours
-            print("[BOT] Taking pre-run visual dump for your reference…")
+                print("\n  Fix the connection issues above first.\n")
+                continue
+            print("[BOT] Taking pre-run visual dump…")
             frame = bot.dm.screencap()
             if frame is not None:
                 save_visual_dump(frame, "bbot_prerun.jpg")
-                print("  Pull bbot_prerun.jpg to verify colours look right.")
-                print("  Press Ctrl+C now if they look wrong, fix with NL or")
-                print("  edit CFG values directly, then restart.\n")
+                print("  Pull bbot_prerun.jpg to verify colours look correct.")
+                print("  If wrong, go back → C → adjust colours → try again.\n")
             try:
                 bot.run()
             except KeyboardInterrupt:
@@ -1179,7 +1636,8 @@ def menu():
             bot._reset_state()
 
         elif c == "q":
-            print("  Bye! 🐰\n")
+            save_settings(CFG)
+            print("  Settings saved. Bye! 🐰\n")
             sys.exit(0)
 
         else:
@@ -1194,7 +1652,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and ":" in sys.argv[1]:
         CFG["device"] = sys.argv[1]
         print(f"[CLI] Device: {CFG['device']}")
-    if len(sys.argv) > 2 and sys.argv[2] in ("auto", "adbutils", "adb"):
+    if len(sys.argv) > 2 and sys.argv[2] in ("auto","adbutils","adb"):
         CFG["backend"] = sys.argv[2]
         print(f"[CLI] Backend: {CFG['backend']}")
     menu()
