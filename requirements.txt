@@ -1,41 +1,27 @@
 # ============================================================
-#  BunnyBot — Self-Learning AI Edition
-#  Python Dependencies (pip)
-#  ✅ Termux-safe: all pip packages below are pure Python
-#     and install without C++ compilation.
+#  BunnyBot — Python dependencies
+#  No AI, no internet, pure local OpenCV vision
 # ============================================================
 
-# ── Core HTTP client ─────────────────────────────────────────
-# Used for direct AI API calls (OpenRouter + Google AI Studio)
-requests>=2.28.0
-
-# ── Fast ADB socket interface ────────────────────────────────
-# Replaces slow subprocess adb calls for screencap, tap, swipe
-# Provides adbutils.AdbClient used in BunnyBotAI.__init__
-adbutils>=2.0.0
-
-# ── PuterGenAI Bridge (Free AI — no API key required) ────────
-# Provides access to Gemini models via Puter.com for free.
-# Optional: bot falls back to requests-based API if not found.
-putergenai>=0.1.0
-
-# ── PyAV — Scrcpy H.264 stream decoding (Optional) ───────────
-# Enables ultra-fast screen capture via Scrcpy server streaming.
-# Remove this line if you do not use the Scrcpy stream feature.
-# May require additional build tools on some systems.
-# av>=12.0.0
-
-# ============================================================
-#  ⚠️  TERMUX USERS — DO NOT pip install these packages.
-#      Use pkg instead (C++ based; pip hangs or fails):
+# ── Install via pkg (Termux) — NOT pip ──────────────────────
 #
-#  pkg install python-numpy       → numpy (pixel reflex)
-#  pkg install opencv-python      → cv2   (template matching, lane detection)
-#  pkg install android-tools      → adb   (device communication)
+#   OpenCV and NumPy MUST come from Termux's package manager.
+#   pip install opencv-python will hang trying to compile C++.
 #
-#  Full Termux quick-start:
-#    pkg update && pkg upgrade -y
-#    pkg install python android-tools python-numpy opencv-python -y
-#    pip install -r requirements.txt
-#    python bunny_bot.py
+#     pkg install python-numpy opencv-python -y
+#
+# ── The ONLY pip package needed ─────────────────────────────
+#
+#   (nothing — this bot has zero pip dependencies)
+#
+# ── Full Termux setup (copy-paste, run once) ─────────────────
+#
+#   pkg update && pkg upgrade -y
+#   pkg install python android-tools python-numpy opencv-python git -y
+#   python bunny_bot.py
+#
+# ── ADB (already included above) ────────────────────────────
+#
+#   pkg install android-tools
+#
 # ============================================================
