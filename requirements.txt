@@ -1,27 +1,56 @@
 # ============================================================
-#  BunnyBot — Python dependencies
-#  No AI, no internet, pure local OpenCV vision
+#  BunnyBot v3 — Dependencies
+#  Dual backend: ADB subprocess  +  adbutils (pure Python)
 # ============================================================
 
-# ── Install via pkg (Termux) — NOT pip ──────────────────────
-#
-#   OpenCV and NumPy MUST come from Termux's package manager.
-#   pip install opencv-python will hang trying to compile C++.
-#
-#     pkg install python-numpy opencv-python -y
-#
-# ── The ONLY pip package needed ─────────────────────────────
-#
-#   (nothing — this bot has zero pip dependencies)
-#
-# ── Full Termux setup (copy-paste, run once) ─────────────────
+# ── REQUIRED — install via pkg (Termux) ─────────────────────
 #
 #   pkg update && pkg upgrade -y
-#   pkg install python android-tools python-numpy opencv-python git -y
+#   pkg install python android-tools python-numpy opencv-python -y
+#
+#   ⚠ NEVER use "pip install opencv-python" on Termux.
+#     It tries to compile C++ and will hang or fail.
+#
+# ── RECOMMENDED — install via pip ───────────────────────────
+#
+#   pip install adbutils --break-system-packages
+#
+#   adbutils enables BACKEND 2: a pure-Python ADB client that
+#   talks directly to the ADB daemon socket.
+#
+#   Why install it?
+#     • No adb binary subprocess calls — faster screencap
+#     • Handles PNG decoding internally — no CRLF corruption
+#     • Often works when the adb subprocess hangs
+#     • Better reconnect and error handling
+#
+#   If you skip it, the bot works fine using ADB subprocess.
+#
+# ── FULL SETUP (copy-paste into Termux) ─────────────────────
+#
+#   pkg update && pkg upgrade -y
+#   pkg install python android-tools python-numpy opencv-python -y
+#   pip install adbutils --break-system-packages
+#   adb pair   <IP>:<PAIR_PORT>
+#   adb connect <IP>:<CONN_PORT>
 #   python bunny_bot.py
 #
-# ── ADB (already included above) ────────────────────────────
+# ── TROUBLESHOOTING ──────────────────────────────────────────
 #
-#   pkg install android-tools
+#   adb: command not found
+#     → pkg install android-tools -y
+#
+#   ModuleNotFoundError: cv2
+#     → pkg install opencv-python -y   (never pip!)
+#
+#   Screen capture failed / screencap returns None
+#     → Run menu option 0 (full diagnostics)
+#     → adb kill-server && adb connect <IP>:<PORT>
+#     → Phone: Developer Options → Revoke USB debugging → reconnect
+#     → Try switching to adbutils backend: menu → B → adbutils
+#
+#   adb devices shows "unauthorized"
+#     → Revoke USB debugging authorizations on phone
+#     → Reconnect — approve the popup that appears
 #
 # ============================================================
