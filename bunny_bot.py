@@ -8,6 +8,13 @@ import io
 import random
 from datetime import datetime
 import requests
+import io
+
+try:
+    import adbutils
+    ADB_AVAILABLE = True
+except ImportError:
+    ADB_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BunnyBot — Self-Learning AI Edition 🧠
@@ -322,6 +329,28 @@ class BunnyBotAI:
         self._last_ai_ts  = 0.0
         self._fail_streak = 0
         self.ai_available = bool(config.get("openrouter_key") or config.get("google_key"))
+        
+        # Init ADB connection (fast socket access)
+        self.adb_device = None
+        if ADB_AVAILABLE:
+            try:
+                adbc = adbutils.AdbClient(host="127.0.0.1", port=5037)
+                if self.config.get("device_id"):
+                    self.adb_device = adbc.device(serial=self.config["device_id"])
+                else:
+                    self.adb_device = adbc.device()
+                if self.adb_device:
+                    print(f"✅ ADB connected via adbutils to: {self.adb_device.serial}")
+            except Exception as e:
+                print(f"⚠️  adbutils connection failed: {e}")
+
+        # Try loading template images for OpenCV
+        self.templates = {}
+        for t_name in ["barrier", "car", "hole"]:
+            t_path = os.path.join(os.path.dirname(__file__), f"template_{t_name}.png")
+            if os.path.exists(t_path):
+                self.templates[t_name] = cv2.imread(t_path, cv2.IMREAD_GRAYSCALE)
+                
         self._get_resolution()
         self.left_roi  = (int(self.h*0.65), int(self.h*0.75), int(self.w*0.10), int(self.w*0.45))
         self.right_roi = (int(self.h*0.65), int(self.h*0.75), int(self.w*0.55), int(self.w*0.90))
@@ -334,26 +363,46 @@ class BunnyBotAI:
 
     def _get_resolution(self):
         try:
-            raw = self._run(self._adb("shell wm size")).decode()
-            self.w, self.h = map(int, raw.split(":")[-1].strip().split("x"))
+            if self.adb_device:
+                info = self.adb_device.window_size()
+                self.w, self.h = info.width, info.height
+            else:
+                raw = self._run(self._adb("shell wm size")).decode()
+                self.w, self.h = map(int, raw.split(":")[-1].strip().split("x"))
         except Exception:
             self.w, self.h = 1080, 2400
 
     def get_frame(self) -> bytes:
+        # Fast grab using adbutils socket instead of subprocess
+        if self.adb_device:
+            img = self.adb_device.screenshot()
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
         return self._run(self._adb("exec-out screencap -p"))
 
     def tap(self, x, y):
-        os.system(self._adb(f"shell input tap {int(x)+random.randint(-8,8)} {int(y)+random.randint(-8,8)}"))
+        cx, cy = int(x)+random.randint(-8,8), int(y)+random.randint(-8,8)
+        if self.adb_device:
+            self.adb_device.click(cx, cy)
+        else:
+            os.system(self._adb(f"shell input tap {cx} {cy}"))
         time.sleep(self.config["tap_cooldown"] + random.uniform(0, 0.05))
 
     def move_left(self):
         y = self.h*0.5
-        os.system(self._adb(f"shell input swipe {int(self.w*.7)} {int(y)} {int(self.w*.3)} {int(y)} 75"))
+        if self.adb_device:
+            self.adb_device.swipe(int(self.w*.7), int(y), int(self.w*.3), int(y), 0.075)
+        else:
+            os.system(self._adb(f"shell input swipe {int(self.w*.7)} {int(y)} {int(self.w*.3)} {int(y)} 75"))
         time.sleep(0.13)
 
     def move_right(self):
         y = self.h*0.5
-        os.system(self._adb(f"shell input swipe {int(self.w*.3)} {int(y)} {int(self.w*.7)} {int(y)} 75"))
+        if self.adb_device:
+            self.adb_device.swipe(int(self.w*.3), int(y), int(self.w*.7), int(y), 0.075)
+        else:
+            os.system(self._adb(f"shell input swipe {int(self.w*.3)} {int(y)} {int(self.w*.7)} {int(y)} 75"))
         time.sleep(0.13)
 
     def jump(self):
@@ -366,13 +415,33 @@ class BunnyBotAI:
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if frame is None: return None
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # 1. Advanced Mode: Template Matching
+            if self.templates:
+                for t_name, t_img in self.templates.items():
+                    if t_img is None: continue
+                    res = cv2.matchTemplate(gray, t_img, cv2.TM_CCOEFF_NORMED)
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                    if max_val > 0.75:  # Confidence threshold
+                        # Determine lane based on x coordinate
+                        x_center = max_loc[0] + (t_img.shape[1] // 2)
+                        
+                        if x_center < self.w * 0.4:
+                            return "MOVE RIGHT" # Obstacle on left, move right
+                        elif x_center > self.w * 0.6:
+                            return "MOVE LEFT"  # Obstacle on right, move left
+                        else:
+                            return "JUMP"       # Obstacle in middle, jump
+
+            # 2. Fallback Mode: Basic Pixel Brightness (Lane detection)
             r1y1,r1y2,r1x1,r1x2 = self.left_roi
             r2y1,r2y2,r2x1,r2x2 = self.right_roi
             lc = int(np.sum(gray[r1y1:r1y2, r1x1:r1x2] > 215))
             rc = int(np.sum(gray[r2y1:r2y2, r2x1:r2x2] > 215))
             if lc > 350 and lc >= rc: return "MOVE RIGHT"
             elif rc > 350:            return "MOVE LEFT"
-        except Exception: pass
+        except Exception as e:
+            print(f"Reflex error: {e}")
         return None
 
     def ai_decide(self, frame_bytes: bytes) -> str | None:
