@@ -1,309 +1,279 @@
-# 🐰 BunnyBot — Self-Learning AI Edition
+# 🐰 BunnyBot — Bunny Runner 3D Automation
 
-> Fully autonomous **Bunny Runner 3D** bot running inside **Termux** on Android.
-> Powered by a **Self-Learning AI system** using **PuterGenAI (Gemini)**, **OpenRouter**, or **Google AI Studio** for intelligent screen analysis and adaptive gameplay.
-> Supports local (one phone) and remote (two-phone) ADB control.
+> Fully autonomous **Bunny Runner 3D** bot running in **Termux** on Android.  
+> **100% local** — pure OpenCV computer vision. No internet. No AI API. No API keys.  
+> Supports same-phone (local ADB) and two-phone (remote ADB over Wi-Fi).
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Termux%20%7C%20Linux-green)
-![AI](https://img.shields.io/badge/AI-OpenRouter%20%7C%20Google%20AI-orange)
+![Vision](https://img.shields.io/badge/Vision-OpenCV%20only-orange)
 
 ---
 
-## 📋 Table of Contents
+## 📋 Contents
 
-1. [Features](#-features)
-2. [Prerequisites](#-prerequisites)
-3. [Step 1 — Termux Package Setup](#-step-1--termux-package-setup)
-4. [Step 2 — Get an API Key](#-step-2--get-an-api-key)
-5. [Step 3 — Clone the Repository](#-step-3--clone-the-repository)
-6. [Step 4 — Install Python Dependencies](#-step-4--install-python-dependencies)
-7. [Step 5 — Connect ADB](#-step-5--connect-adb)
-8. [Step 6 — Run the Bot](#-step-6--run-the-bot)
-9. [Menu Reference](#-menu-reference)
-10. [How the Self-Learning System Works](#-how-the-self-learning-system-works)
-11. [Template Images (Optional)](#-template-images-optional)
-12. [Troubleshooting](#-troubleshooting)
-13. [Architecture Overview](#-architecture-overview)
+1. [How It Works](#-how-it-works)
+2. [Template Files](#-template-files)
+3. [Prerequisites](#-prerequisites)
+4. [Step 1 — Termux Setup](#-step-1--termux-setup)
+5. [Step 2 — Connect ADB](#-step-2--connect-adb)
+6. [Step 3 — Run the Bot](#-step-3--run-the-bot)
+7. [Menu Reference](#-menu-reference)
+8. [Tuning Guide](#-tuning-guide)
+9. [Troubleshooting](#-troubleshooting)
 
 ---
 
-## ✨ Features
+## ⚙️ How It Works
 
-- 🧠 **Self-Learning AI** — On first run, the AI studies the game screen and builds a persistent `game_knowledge.json` rulebook. Rules are refined automatically after each session.
-- 🤖 **Dual AI Provider Support** — Choose between **OpenRouter** (access to many models) or **Google AI Studio** directly. Switch live from the menu.
-- 🆓 **PuterGenAI Bridge** — Optionally use the free [Puter.com](https://puter.com) AI bridge (no API key needed) via `putergenai`.
-- ⚡ **Pixel Reflex Layer** — Sub-100ms obstacle detection via OpenCV with multi-scale template matching and lane brightness detection — no API calls needed during gameplay.
-- 🎬 **Scrcpy H.264 Streaming** — Optional ultra-fast screen capture using a Scrcpy server and PyAV, bypassing slower `adb screencap` calls.
-- 📱 **Termux-native** — No C++ compilation required; all dependencies install cleanly via `pkg` or `pip`.
-- 🔗 **Local & Remote ADB** — Control the game on the same phone or remotely over Wi-Fi.
-- 🛡️ **Graceful Fallback Chain** — Scrcpy stream → adbutils socket → subprocess `adb screencap`. If AI is unavailable, the bot runs in pixel-only mode.
-- 👁️ **Supervisor AI Recovery** — If no obstacles are detected for 5 seconds, a background AI thread analyses the screen and handles menus, ads, or death screens automatically.
-- 💾 **Persistent Knowledge Base** — The bot's learned rules survive across sessions and are stored in `game_knowledge.json`.
+Bunny Runner 3D is a lane-switching endless runner. The bunny runs on a winding
+3D track; you swipe left or right to steer around turns and dodge fences.
+
+The bot replaces your swipes using **ADB** (Android Debug Bridge) and decides
+what to do using **OpenCV pixel analysis** — no cloud, no AI, no internet.
+
+```
+ADB screencap  →  BGR image  →  OpenCV analysis  →  ADB swipe
+(every ~100ms)                                     (left or right)
+```
+
+### Decision logic (priority order)
+
+```
+1.  Dark overlay + bright UI visible?           →  RESTART  (tap retry)
+2.  Fence pixels / template in LEFT  danger zone →  RIGHT   (dodge away)
+3.  Fence pixels / template in RIGHT danger zone →  LEFT    (dodge away)
+4.  More path pixels on RIGHT half of lookahead  →  RIGHT   (follow the path)
+5.  More path pixels on LEFT  half of lookahead  →  LEFT
+6.  Otherwise                                    →  STRAIGHT (do nothing)
+```
+
+### Where the bot looks on screen
+
+```
+┌─────────────────────────────┐  ← top of screen
+│                             │
+│  ┌───────────────────────┐  │  ← 30% down
+│  │   LOOK-AHEAD STRIP    │  │    bot measures left vs right path pixels here
+│  │          │            │  │    to determine which way the track curves
+│  └───────────────────────┘  │  ← 55% down
+│                             │
+│  ┌──────┐       ┌──────┐    │  ← danger zones (28%–68% vertically)
+│  │  DZ  │       │  DZ  │    │    monitors for fence colour + template match
+│  │ LEFT │       │RIGHT │    │
+│  └──────┘       └──────┘    │
+│                             │
+└─────────────────────────────┘  ← bottom of screen
+```
+
+---
+
+## 🖼️ Template Files
+
+Place these three images in the **same folder as `bunny_bot.py`**:
+
+| File | Purpose |
+|------|---------|
+| `template_carrot.png` | Reference carrot sprite |
+| `template_fence.png`  | Reference fence sprite — used for obstacle detection |
+| `template_rabbit.png` | Reference rabbit/bunny sprite |
+
+The bot tests each template at **7 different scales** (35%–150%) so it works
+across different phone resolutions without any manual sizing.
+
+> **Only `template_fence.png` is critical for gameplay.**  
+> Carrot and rabbit templates are loaded but don't trigger any movement — they're
+> available for future enhancements (e.g. targeting carrot lanes).
 
 ---
 
 ## 🔧 Prerequisites
 
-Before you begin, ensure the following:
-
-- ✅ **Termux** is installed on your Android phone ([F-Droid recommended](https://f-droid.org/packages/com.termux/))
-- ✅ **Developer Options** are enabled on your Android device
-- ✅ **Wireless Debugging** is turned ON (Settings → Developer Options → Wireless Debugging)
-- ✅ You have a working **internet connection** (for package downloads and AI API calls)
+- ✅ **Termux** installed ([F-Droid build recommended](https://f-droid.org/packages/com.termux/))
+- ✅ **Developer Options** enabled on your Android device
+- ✅ **Wireless Debugging** turned ON (Settings → Developer Options → Wireless Debugging)
 
 ---
 
-## 📦 Step 1 — Termux Package Setup
+## 📦 Step 1 — Termux Setup
 
-Open **Termux** and run the following commands **one by one**:
+Open Termux and run these commands:
 
 ```bash
-# 1. Update package lists
+# 1. Update packages
 pkg update && pkg upgrade -y
-```
 
-```bash
-# 2. Install core tools
-pkg install git python android-tools -y
-```
+# 2. Install everything needed
+pkg install python android-tools python-numpy opencv-python git -y
 
-```bash
-# 3. Install OpenCV and NumPy (mandatory for pixel-reflex and template matching)
-#    ⚠️  Use pkg — do NOT use pip install opencv-python (it will hang or fail on Termux!)
-pkg install python-numpy opencv-python -y
-```
-
-```bash
-# 4. Grant Termux access to shared storage (recommended)
+# 3. Grant storage access (recommended)
 termux-setup-storage
-```
 
----
-
-## 🔑 Step 2 — Get an API Key
-
-BunnyBot supports **two AI providers**. You only need one, but you can configure both and switch between them in the menu.
-
-### Option A — OpenRouter (Recommended)
-
-1. Go to **[https://openrouter.ai](https://openrouter.ai)**
-2. Sign in and navigate to **Keys** → **Create Key**
-3. Copy your key — it will start with `sk-or-...`
-4. Many models on OpenRouter have a **free tier** — no credit card required for basic use
-
-### Option B — Google AI Studio
-
-1. Go to **[https://aistudio.google.com](https://aistudio.google.com)**
-2. Sign in with your Google account
-3. Click **"Get API Key"** → **"Create API Key"**
-4. Copy your key — the free tier is sufficient for running the bot
-
-> **Pro Tip:** You can also use the **PuterGenAI bridge** (Option `putergenai`) which requires no API key at all.
-> Install it in Step 4 and the bot will use it automatically if no other key is configured.
-
----
-
-## 📥 Step 3 — Clone the Repository
-
-```bash
+# 4. Clone the repo
 cd ~/storage/shared
 git clone https://github.com/Kaddu-Hacker/Bunny-run2.git
 cd Bunny-run2
 ```
 
----
-
-## 📦 Step 4 — Install Python Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-This installs all required Python packages: `requests`, `adbutils`, `putergenai`, and optionally `av` (PyAV) for Scrcpy streaming.
-
-### Full Dependency Summary
-
-| Package | How to Install | Purpose |
-|---|---|---|
-| `python-numpy` | `pkg install python-numpy` | Required for pixel reflex (OpenCV) |
-| `opencv-python` | `pkg install opencv-python` | Required for pixel reflex & template matching |
-| `android-tools` | `pkg install android-tools` | Provides the `adb` command |
-| `requests` | `pip install requests` | HTTP client for AI API calls |
-| `adbutils` | `pip install adbutils` | Fast ADB socket interface (replaces subprocess) |
-| `putergenai` | `pip install putergenai` | Free AI bridge via Puter.com (no key needed) |
-| `av` (PyAV) | `pip install av` | Optional: Scrcpy H.264 stream decoding |
-
-> ⚠️ **Termux Warning:** Never use `pip install opencv-python` or `pip install numpy` on Termux. Always use `pkg install python-numpy opencv-python`. The pip versions compile C++ and will hang indefinitely.
+> ⚠️  **Never** run `pip install opencv-python` on Termux.  
+> It will try to compile C++ for hours and likely fail.  
+> Always use `pkg install opencv-python`.
 
 ---
 
-## 🔗 Step 5 — Connect ADB
+## 🔗 Step 2 — Connect ADB
 
-### Option A — Same Phone (Local Control)
+### Option A — Same phone (Termux controls itself)
 
-1. Go to **Settings → Developer Options → Wireless Debugging**
-2. Tap **"Pair device with pairing code"** — note the **IP address** and **Pairing Port**
-3. In Termux, run:
-
-```bash
-adb pair <IP_ADDRESS>:<PAIRING_PORT>
-```
-
-*(Enter the 6-digit pairing code when prompted)*
-
-4. Now connect:
+1. **Settings → Developer Options → Wireless Debugging** → enable it
+2. Tap **"Pair device with pairing code"** — note the IP and pairing port
+3. In Termux:
 
 ```bash
-adb connect <IP_ADDRESS>:<CONNECTION_PORT>
+adb pair <IP>:<PAIRING_PORT>
+# enter the 6-digit code when asked
 ```
 
-*(The connection port is shown on the main Wireless Debugging screen — it is different from the pairing port)*
+4. Then connect (use the port on the main Wireless Debugging screen):
+
+```bash
+adb connect <IP>:<CONNECTION_PORT>
+```
 
 5. Verify:
 
 ```bash
 adb devices
+# should show:  <IP>:<PORT>   device
 ```
 
-You should see your device listed as `<IP>:<PORT> device`.
+### Option B — Two phones (Phone A runs Termux, Phone B runs the game)
+
+1. Both phones on the **same Wi-Fi network**
+2. Enable Wireless Debugging on **Phone B**
+3. From **Phone A** (Termux), pair and connect to **Phone B's** IP:PORT (same steps above)
+4. In the bot menu, set the device to Phone B's `IP:PORT`
 
 ---
 
-### Option B — Two Phones (Remote Control)
-
-Use **Phone A** (running Termux + the script) to control **Phone B** (running the game).
-
-1. Connect both phones to the **same Wi-Fi network**
-2. On **Phone B**: Enable Wireless Debugging (Settings → Developer Options)
-3. On **Phone A** (Termux): Pair and connect to **Phone B's** IP and ports (same steps as Option A)
-4. Run `adb devices` on Phone A — Phone B's IP should appear in the list
-5. Note the `IP:PORT` — you will enter it into the bot menu
-
----
-
-## 🚀 Step 6 — Run the Bot
+## 🚀 Step 3 — Run the Bot
 
 ```bash
+cd ~/storage/shared/Bunny-run2
 python bunny_bot.py
 ```
 
-The interactive menu will appear. Follow the on-screen prompts:
+**Recommended first-time flow:**
 
-1. Set your **OpenRouter Key** (option `1`) or **Google AI Key** (option `2`)
-2. Select your **Active AI Method** (option `3`) — toggle between OpenRouter and Google
-3. Optionally set a **Target Device** (option `4`) — leave blank for local, or enter `IP:PORT` for remote
-4. Press **`S`** to start the bot
-5. **Switch to the game** — you have 5 seconds before the bot goes live
+1. Open the game on your phone and get to a running screen
+2. In the bot menu, press **`C`** — this auto-detects the path colour for your device
+3. Apply the suggested values when prompted
+4. Press **`S`** to start — you have 5 seconds to switch to the game
 
-To stop the bot at any time, press **`Ctrl + C`** in Termux. On shutdown, the bot will automatically consolidate any new observations into the knowledge base.
+**Press `Ctrl+C` at any time to stop.**
 
 ---
 
 ## 🎮 Menu Reference
 
-| Option | Key | Description |
-|---|---|---|
-| Set OpenRouter API Key | `1` | Paste your OpenRouter key (starts with `sk-or-...`) |
-| Set Google AI Studio Key | `2` | Paste your Google AI Studio key |
-| Select Active AI Method | `3` | Toggle between OpenRouter and Google AI Studio |
-| Set Target Device | `4` | Leave blank for local. Enter `IP:PORT` for a remote phone. |
-| Toggle AI Mode | `5` | Switch between AI-assisted and pixel-only mode. |
-| Clear Knowledge Base | `6` | Wipe `game_knowledge.json` and reset all learned rules. |
-| Start Bot | `S` | Launch the bot with current settings. |
-| Quit | `Q` | Exit the program. |
+| Key | Option | Notes |
+|-----|--------|-------|
+| `1` | Set target device | Blank = auto-detect first connected device |
+| `2` | Change loop FPS | Default 10. Higher = faster reaction, more CPU |
+| `3` | Change swipe speed/distance | Default 80ms / 300px |
+| `4` | Change action cooldown | Default 0.20s — prevents swipe spam |
+| `5` | Toggle debug logging | Prints every frame decision to terminal |
+| `6` | Toggle save debug frames | Saves annotated screenshots to `./debug_frames/` |
+| `7` | Change game package name | Default: `com.kwalee.bunnyrunner` |
+| `8` | Adjust fence sensitivity | Default threshold: 280px |
+| `9` | Adjust path deadband | Default 12% — how imbalanced L/R must be to act |
+| `C` | Calibrate path colour | **Run this first while in-game on a running screen** |
+| `S` | Start the bot | |
+| `Q` | Quit | |
 
 ---
 
-## 🧠 How the Self-Learning System Works
+## 🎛️ Tuning Guide
 
-BunnyBot uses a **three-phase learning loop** combined with a **two-layer real-time decision system**:
+### The bot isn't turning / always says STRAIGHT
 
-### Phase 1 — Initial Game Learning (First Run Only)
+**This is the most common issue** and almost always means the path colour
+is wrong. Fix it in two minutes:
 
-On the very first session, if no rules exist in the knowledge base, the AI analyses a screenshot and generates a structured summary of the game: what to do in menus, how to react to obstacles, how to handle death screens and ads. This is saved to `game_knowledge.json`.
+1. Open the game to an active running screen
+2. In the bot menu press `C` (Calibrate)
+3. The bot samples the path colour under the bunny and prints:
+   ```
+   path_hsv_lo = [12, 22, 145]
+   path_hsv_hi = [34, 95, 255]
+   ```
+4. Press `Y` to apply for the current session, or copy them into `CFG` in the script
 
-### Phase 2 — Live Gameplay
+### The bot turns too much / jittery
 
-During each session, every action taken (by the reflex layer or AI) is logged as an observation along with the current game state (`PLAYING`, `DEAD`, `MAIN_MENU`, etc.).
+Increase the path deadband (menu `9`). The default is 12% — try 18% or 22%.
 
-### Phase 3 — Knowledge Consolidation (On Shutdown)
+```python
+"path_deadband": 0.18,   # in CFG at top of script
+```
 
-When you press `Ctrl+C`, the bot sends all new observations to the AI and asks it to extract any new rules not already covered. New rules are appended to the knowledge base for the next session. This means **the bot gets smarter every time you run it**.
+### Fences aren't being detected
+
+Lower the fence pixel threshold (menu `8`). Default is 280 — try 150.
+
+```python
+"fence_px_threshold": 150,
+```
+
+### Swipes aren't registering in the game
+
+The game might need a larger or faster swipe:
+
+```python
+"swipe_ms": 60,    # faster
+"swipe_px": 400,   # longer
+```
+
+### Enable debug mode to see what the bot is thinking
+
+Press `5` in the menu (debug log ON), then start the bot. Every frame prints:
 
 ```
-game_knowledge.json
-  ├── game_summary    — One-sentence game description
-  ├── rules           — Accumulated gameplay rules
-  ├── session_count   — Total sessions run
-  └── new_observations— Current session log (cleared on consolidation)
+[00042] RIGHT     FENCE → RIGHT    pathL/R=2100/1800  fenceL/R=420/85  9.8fps
+[00043] STRAIGHT  PATH → STRAIGHT  pathL/R=1950/2020  fenceL/R=40/30   9.9fps
 ```
 
----
-
-## 🖼️ Template Images (Optional)
-
-The pixel reflex layer supports **multi-scale template matching** for precise obstacle detection. To enable this, place grayscale PNG template images of in-game obstacles in the project root directory:
-
-| Filename | Contents |
-|---|---|
-| `template_fence.png` | A cropped screenshot of a fence obstacle |
-| `template_carrot.png` | A cropped screenshot of a carrot collectible |
-| `template_rabbit.png` | A cropped screenshot of the bunny character |
-
-Without these files, the bot falls back to **brightness-based lane detection**, which still works reliably.
+Enable frame saving (`6`) to get annotated screenshots in `./debug_frames/` showing
+exactly which zones the bot is looking at.
 
 ---
 
 ## 🐛 Troubleshooting
 
 | Problem | Fix |
-|---|---|
-| `adb: command not found` | Run `pkg install android-tools -y` |
-| Screen capture fails immediately | Run `adb kill-server`, then reconnect with `adb connect` |
-| Bot not reacting to obstacles | Ensure OpenCV is installed via `pkg install opencv-python` |
-| `ModuleNotFoundError: requests` | Run `pip install requests` |
-| `ModuleNotFoundError: adbutils` | Run `pip install adbutils` |
-| `ModuleNotFoundError: putergenai` | Run `pip install putergenai` |
-| AI returning gibberish or no response | Verify your API key is correct via Option 1 or 2 in the menu |
-| Bot tap-spamming on an open road | The reflex brightness threshold is triggering — this usually self-corrects after a few frames |
-| `protocol fault` ADB error | Run `adb kill-server` first, then retry `adb connect` |
-| Scrcpy stream not starting | Ensure `scrcpy-server.jar` is in the project root directory |
-| Knowledge base seems wrong | Use Option 6 in the menu to reset it and let the bot re-learn |
-| Game not found when auto-restarting | Verify `PACKAGE_NAME` in `bunny_bot.py` matches your installed game version (`com.bunny.runner3D.dg`) |
+|---------|-----|
+| `adb: command not found` | `pkg install android-tools -y` |
+| `ModuleNotFoundError: cv2` | `pkg install opencv-python -y` (never pip) |
+| Screen capture returns None | `adb kill-server` then `adb connect <IP>:<PORT>` |
+| Bot always says STRAIGHT | Run calibration: menu → `C` |
+| Bot turning randomly (wrong direction) | Swap `dz_left_x` and `dz_right_x` values in CFG |
+| Game-over not detected | Adjust `gameover_dark_frac` or `gameover_bright_px` in CFG |
+| `protocol fault` ADB error | `adb kill-server` then reconnect |
+| Package not found on restart | Check package name: `adb shell pm list packages \| grep bunny` |
 
 ---
 
-## ⚙️ Architecture Overview
-
-BunnyBot uses a **two-layer real-time decision system** backed by a **persistent knowledge base**:
+## 🏗️ File Structure
 
 ```
-Screen (Scrcpy H.264 Stream / adbutils socket / adb screencap)
-        │
-        ▼
-┌──────────────────────────────┐
-│   AI Layer (background)      │  ← Only active on first run (Phase 1)
-│   • Phase 1: Learn the game  │    or when Supervisor Recovery triggers.
-│   • Phase 3: Consolidate     │    Uses OpenRouter / Google AI / PuterGenAI.
-│   • Supervisor Recovery      │    Handles menus, ads, death screens.
-└──────────────────────────────┘
-        │
-        ▼
-┌──────────────────────────────┐
-│  Pixel Reflex (~80ms loop)   │  ← Primary gameplay driver.
-│  • Template matching (cv2)   │    No API calls. Uses OpenCV to detect
-│  • Brightness lane detection │    obstacles and determine dodge direction.
-│  • Supervisor trigger (5s)   │    Falls back to brightness scan if no
-└──────────────────────────────┘    templates are found.
-        │
-        ▼
-     ADB Tap / Swipe → Device
+Bunny-run2/
+├── bunny_bot.py          ← the bot (only file you need to run)
+├── template_carrot.png   ← carrot reference image
+├── template_fence.png    ← fence reference image  (most important)
+├── template_rabbit.png   ← rabbit reference image
+├── requirements.txt      ← explains pkg installs (no pip deps)
+└── README.md
 ```
-
-**Screen capture priority:** Scrcpy H.264 stream (fastest) → adbutils socket screenshot → subprocess `adb screencap` (slowest fallback).
-
-**AI call priority:** PuterGenAI bridge → OpenRouter API → Google AI Studio API.
 
 ---
 
